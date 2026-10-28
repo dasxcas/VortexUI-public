@@ -1,0 +1,13 @@
+{
+  "name": "VortexUI",
+  "short_name": "VortexUI",
+  "description": "Next-generation proxy management panel",
+  "start_url": "/overview",
+  "display": "standalone",
+  "background_color": "#0f1724",
+  "theme_color": "#6366f1",
+  "icons": [
+    { "src": "/Logo.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "/Logo.svg", "sizes": "192x192", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}

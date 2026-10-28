@@ -1,0 +1,44 @@
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { dict, RTL_LANGS, type Lang, type TKey } from "./dict";
+
+interface I18nState {
+  lang: Lang;
+  dir: "ltr" | "rtl";
+  setLang: (l: Lang) => void;
+  t: (key: TKey) => string;
+}
+
+const I18nContext = createContext<I18nState | null>(null);
+const KEY = "vortex.lang";
+
+export function I18nProvider({ children }: { children: React.ReactNode }) {
+  const [lang, setLangState] = useState<Lang>(() => {
+    const stored = localStorage.getItem(KEY) as Lang | null;
+    if (stored) return stored;
+    // A Chinese browser gets a Chinese panel on first visit; everyone else
+    // keeps the English default. The switch still overrides it, persistently.
+    return navigator.language?.toLowerCase().startsWith("zh") ? "zh" : "en";
+  });
+  const dir = RTL_LANGS.includes(lang) ? "rtl" : "ltr";
+
+  useEffect(() => {
+    document.documentElement.lang = lang;
+    document.documentElement.dir = dir;
+  }, [lang, dir]);
+
+  const setLang = useCallback((l: Lang) => {
+    localStorage.setItem(KEY, l);
+    setLangState(l);
+  }, []);
+
+  const t = useCallback((key: TKey) => dict[lang][key] ?? dict.en[key] ?? key, [lang]);
+
+  const value = useMemo<I18nState>(() => ({ lang, dir, setLang, t }), [lang, dir, setLang, t]);
+  return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
+}
+
+export function useI18n(): I18nState {
+  const ctx = useContext(I18nContext);
+  if (!ctx) throw new Error("useI18n must be used within I18nProvider");
+  return ctx;
+}

@@ -1,0 +1,403 @@
+package postgres
+
+import (
+	"context"
+	_ "embed"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/vortexui/vortexui/internal/domain"
+	"github.com/vortexui/vortexui/internal/panel/port"
+)
+
+//go:embed schema.sql
+var schemaSQL string
+
+// openTestStore connects to the database named by VORTEX_TEST_DB and resets the
+// schema. Without that env var the integration tests skip, so `go test ./...`
+// stays green on a machine with no database while CI (which sets it) runs them
+// against a real Postgres/TimescaleDB.
+func openTestStore(t *testing.T) *Store {
+	t.Helper()
+	dsn := os.Getenv("VORTEX_TEST_DB")
+	if dsn == "" {
+		t.Skip("VORTEX_TEST_DB not set; skipping Postgres integration test")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx, "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"); err != nil {
+		t.Fatalf("reset schema: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx, schemaSQL); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
+	t.Cleanup(st.Close)
+	return st
+}
+
+func TestIntegration_UserLifecycleAndTraffic(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	nodes, inbounds, users, traffic := st.Nodes(), st.Inbounds(), st.Users(), st.Traffic()
+
+	// Node + inbound the user will be bound to.
+	node := &domain.Node{ID: uuid.New(), Name: "n1", Address: "1.2.3.4:50051", Core: domain.CoreXray, CreatedAt: time.Now()}
+	if err := nodes.Create(ctx, node); err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	in := &domain.Inbound{ID: uuid.New(), NodeID: node.ID, Tag: "vless-ws", Protocol: domain.ProtoVLESS, Port: 443, Network: "ws", Security: domain.SecurityTLS, SNI: []string{"a.com"}, Enabled: true}
+	if err := inbounds.Create(ctx, in); err != nil {
+		t.Fatalf("create inbound: %v", err)
+	}
+
+	// Create a user and bind it to the inbound (user-centric model).
+	u := &domain.User{
+		ID: uuid.New(), Username: "alice", Status: domain.UserStatusActive,
+		DataLimit:     1 << 30,
+		ResetStrategy: domain.ResetNone,
+		Proxies:       domain.UserCredentials{VMessUUID: uuid.New(), VLESSUUID: uuid.New(), SSMethod: "aes-128-gcm"},
+		SubToken: "tok-alice", CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := users.Create(ctx, u); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := users.SetInbounds(ctx, u.ID, []uuid.UUID{in.ID}); err != nil {
+		t.Fatalf("set inbounds: %v", err)
+	}
+
+	// Atomic traffic accumulation, twice, must sum (no double-count, no lost write).
+	if err := users.AddUsedTraffic(ctx, u.ID, 100); err != nil {
+		t.Fatalf("add traffic 1: %v", err)
+	}
+	if err := users.AddUsedTraffic(ctx, u.ID, 250); err != nil {
+		t.Fatalf("add traffic 2: %v", err)
+	}
+
+	got, err := users.GetByID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if got.UsedTraffic != 350 {
+		t.Errorf("used_traffic = %d, want 350", got.UsedTraffic)
+	}
+	if got.Username != "alice" || got.Proxies.VLESSUUID != u.Proxies.VLESSUUID {
+		t.Errorf("round-trip mismatch: %+v", got)
+	}
+
+	// The binding must be readable back.
+	bound, err := users.InboundsFor(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("inbounds for: %v", err)
+	}
+	if len(bound) != 1 || bound[0].Tag != "vless-ws" {
+		t.Errorf("bindings = %+v, want [vless-ws]", bound)
+	}
+
+	// Time-series write + bucketed read.
+	now := time.Now().UTC()
+	if err := traffic.WriteBatch(ctx, []domain.TrafficPoint{
+		{Time: now, UserID: u.ID, NodeID: node.ID, Up: 10, Down: 20},
+		{Time: now.Add(time.Second), UserID: u.ID, NodeID: node.ID, Up: 5, Down: 5},
+	}); err != nil {
+		t.Fatalf("write traffic: %v", err)
+	}
+	series, err := traffic.UsageSeries(ctx, u.ID, port.SeriesQuery{
+		FromUnix: now.Add(-time.Hour).Unix(), ToUnix: now.Add(time.Hour).Unix(), Bucket: "1h",
+	})
+	if err != nil {
+		t.Fatalf("usage series: %v", err)
+	}
+	var up, down int64
+	for _, p := range series {
+		up += p.Up
+		down += p.Down
+	}
+	if up != 15 || down != 25 {
+		t.Errorf("series totals up/down = %d/%d, want 15/25", up, down)
+	}
+
+	// Not-found path normalizes to the domain sentinel.
+	if _, err := users.GetByID(ctx, uuid.New()); err != domain.ErrNotFound {
+		t.Errorf("missing user err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestIntegration_OutboundRoutingBalancerRoundTrip(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	nodes := st.Nodes()
+	outbounds, routing, balancers := st.Outbounds(), st.Routing(), st.Balancers()
+
+	node := &domain.Node{ID: uuid.New(), Name: "n1", Address: "1.2.3.4:50051", Core: domain.CoreXray, CreatedAt: time.Now()}
+	if err := nodes.Create(ctx, node); err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	// Outbound round-trip with credentials + transport.
+	o := &domain.Outbound{
+		ID: uuid.New(), NodeID: node.ID, Tag: "proxy-de", Protocol: domain.OutVLESS,
+		Address: "de.example.com", Port: 443, UUID: uuid.NewString(), Flow: "xtls-rprx-vision",
+		Network: "tcp", Security: domain.SecurityTLS, SNI: "de.example.com",
+		Raw: map[string]any{"note": "primary"}, Enabled: true,
+	}
+	if err := outbounds.Create(ctx, o); err != nil {
+		t.Fatalf("create outbound: %v", err)
+	}
+	gotOut, err := outbounds.GetByID(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("get outbound: %v", err)
+	}
+	if gotOut.Tag != "proxy-de" || gotOut.Protocol != domain.OutVLESS || gotOut.SNI != "de.example.com" || gotOut.Raw["note"] != "primary" {
+		t.Errorf("outbound round-trip mismatch: %+v", gotOut)
+	}
+
+	// Routing rule round-trip with slice matchers.
+	rule := &domain.RoutingRule{
+		ID: uuid.New(), NodeID: node.ID, Priority: 5, Name: "ads",
+		Domains: []string{"geosite:category-ads"}, Port: "80,443",
+		OutboundTag: "blocked", Enabled: true,
+	}
+	if err := routing.Create(ctx, rule); err != nil {
+		t.Fatalf("create rule: %v", err)
+	}
+	rules, err := routing.ListByNode(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("list rules: %v", err)
+	}
+	if len(rules) != 1 || rules[0].OutboundTag != "blocked" || len(rules[0].Domains) != 1 || rules[0].Port != "80,443" {
+		t.Errorf("routing round-trip mismatch: %+v", rules)
+	}
+
+	// Balancer round-trip.
+	b := &domain.Balancer{
+		ID: uuid.New(), NodeID: node.ID, Tag: "lb", Selectors: []string{"proxy-"},
+		Strategy: domain.BalancerLeastPing, Observe: true, ProbeInterval: "5s", Enabled: true,
+	}
+	if err := balancers.Create(ctx, b); err != nil {
+		t.Fatalf("create balancer: %v", err)
+	}
+	gotBal, err := balancers.GetByID(ctx, b.ID)
+	if err != nil {
+		t.Fatalf("get balancer: %v", err)
+	}
+	if gotBal.Tag != "lb" || gotBal.Strategy != domain.BalancerLeastPing || len(gotBal.Selectors) != 1 || !gotBal.Observe {
+		t.Errorf("balancer round-trip mismatch: %+v", gotBal)
+	}
+
+	// Deleting the node cascades to its outbounds/routing/balancers.
+	if err := nodes.Delete(ctx, node.ID); err != nil {
+		t.Fatalf("delete node: %v", err)
+	}
+	if outs, _ := outbounds.ListByNode(ctx, node.ID); len(outs) != 0 {
+		t.Errorf("outbounds not cascaded on node delete: %d", len(outs))
+	}
+	if rs, _ := routing.ListByNode(ctx, node.ID); len(rs) != 0 {
+		t.Errorf("routing not cascaded on node delete: %d", len(rs))
+	}
+	if bs, _ := balancers.ListByNode(ctx, node.ID); len(bs) != 0 {
+		t.Errorf("balancers not cascaded on node delete: %d", len(bs))
+	}
+}
+
+func TestIntegration_BackupRestoreReplacesConfig(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	nodes, inbounds, users := st.Nodes(), st.Inbounds(), st.Users()
+
+	// Pre-existing config that restore must wipe.
+	oldNode := &domain.Node{ID: uuid.New(), Name: "old", Address: "9.9.9.9:50051", Core: domain.CoreXray, CreatedAt: time.Now()}
+	if err := nodes.Create(ctx, oldNode); err != nil {
+		t.Fatalf("create old node: %v", err)
+	}
+	oldIn := &domain.Inbound{ID: uuid.New(), NodeID: oldNode.ID, Tag: "old-in", Protocol: domain.ProtoVLESS, Port: 443, Enabled: true}
+	if err := inbounds.Create(ctx, oldIn); err != nil {
+		t.Fatalf("create old inbound: %v", err)
+	}
+
+	// Snapshot describing a completely different fleet.
+	newNodeID, newInID, newUID := uuid.New(), uuid.New(), uuid.New()
+	snap := &domain.Backup{
+		Version: domain.BackupVersionLegacy,
+		Nodes:   []*domain.Node{{ID: newNodeID, Name: "new", Address: "1.1.1.1:50051", Core: domain.CoreSingbox, CreatedAt: time.Now()}},
+		Inbounds: []*domain.Inbound{
+			{ID: newInID, NodeID: newNodeID, Tag: "new-in", Protocol: domain.ProtoVLESS, Port: 8443, Network: "tcp", Security: domain.SecurityReality, Enabled: true},
+		},
+		Outbounds: []*domain.Outbound{{ID: uuid.New(), NodeID: newNodeID, Tag: "direct", Protocol: domain.OutFreedom, Enabled: true}},
+		Routing:   []*domain.RoutingRule{{ID: uuid.New(), NodeID: newNodeID, InboundTags: []string{"new-in"}, OutboundTag: "direct", Enabled: true}},
+		Balancers: []*domain.Balancer{{ID: uuid.New(), NodeID: newNodeID, Tag: "lb", Selectors: []string{"p"}, Strategy: domain.BalancerRandom, Enabled: true}},
+		Users: []*domain.User{{
+			ID: newUID, Username: "carol", Status: domain.UserStatusActive, ResetStrategy: domain.ResetNone,
+			Proxies: domain.UserCredentials{VMessUUID: uuid.New(), VLESSUUID: uuid.New(), SSMethod: "aes-128-gcm"},
+			SubToken: "tok-carol", CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		}},
+		Bindings: []domain.UserProxy{{UserID: newUID, InboundID: newInID}},
+	}
+
+	if err := st.Backup().Restore(ctx, snap); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	// Old node (and its cascaded inbound) must be gone.
+	if _, err := nodes.GetByID(ctx, oldNode.ID); err != domain.ErrNotFound {
+		t.Errorf("old node should be wiped, got err=%v", err)
+	}
+	// New fleet must be present.
+	list, err := nodes.List(ctx)
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	if len(list) != 1 || list[0].Name != "new" {
+		t.Errorf("nodes after restore = %+v, want only 'new'", list)
+	}
+	carol, err := users.GetByID(ctx, newUID)
+	if err != nil || carol.Username != "carol" {
+		t.Fatalf("restored user missing: %v", err)
+	}
+	bound, err := users.InboundsFor(ctx, newUID)
+	if err != nil || len(bound) != 1 || bound[0].Tag != "new-in" {
+		t.Errorf("restored binding wrong: %+v err=%v", bound, err)
+	}
+}
+
+func TestIntegration_InboundGeoPolicyAndSpeedLimitRoundTrip(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	nodes, inbounds := st.Nodes(), st.Inbounds()
+
+	node := &domain.Node{ID: uuid.New(), Name: "n1", Address: "1.2.3.4:50051", Core: domain.CoreXray, CreatedAt: time.Now()}
+	if err := nodes.Create(ctx, node); err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	// Inbound carrying both a geo policy and a non-zero speed limit.
+	in := &domain.Inbound{
+		ID: uuid.New(), NodeID: node.ID, Tag: "vless-geo", Protocol: domain.ProtoVLESS,
+		Port: 443, Network: "ws", Security: domain.SecurityTLS,
+		SpeedLimit: 1 << 20,
+		GeoPolicy:  &domain.GeoPolicy{AllowedCountries: []string{"IR", "TR"}},
+		Enabled:    true,
+	}
+	if err := inbounds.Create(ctx, in); err != nil {
+		t.Fatalf("create inbound: %v", err)
+	}
+
+	got, err := inbounds.GetByID(ctx, in.ID)
+	if err != nil {
+		t.Fatalf("get inbound: %v", err)
+	}
+	if got.SpeedLimit != 1<<20 {
+		t.Errorf("speed_limit = %d, want %d", got.SpeedLimit, 1<<20)
+	}
+	if got.GeoPolicy == nil {
+		t.Fatalf("geo_policy = nil, want allowed [IR TR]")
+	}
+	if len(got.GeoPolicy.AllowedCountries) != 2 ||
+		got.GeoPolicy.AllowedCountries[0] != "IR" || got.GeoPolicy.AllowedCountries[1] != "TR" {
+		t.Errorf("geo_policy allowed = %v, want [IR TR]", got.GeoPolicy.AllowedCountries)
+	}
+	if len(got.GeoPolicy.BlockedCountries) != 0 {
+		t.Errorf("geo_policy blocked = %v, want empty", got.GeoPolicy.BlockedCountries)
+	}
+
+	// Update clearing the geo policy must persist as "no policy" (nil on read).
+	in.GeoPolicy = nil
+	in.SpeedLimit = 0
+	if err := inbounds.Update(ctx, in); err != nil {
+		t.Fatalf("update inbound: %v", err)
+	}
+	got2, err := inbounds.GetByID(ctx, in.ID)
+	if err != nil {
+		t.Fatalf("get inbound after update: %v", err)
+	}
+	if got2.GeoPolicy != nil {
+		t.Errorf("geo_policy after clear = %+v, want nil", got2.GeoPolicy)
+	}
+	if got2.SpeedLimit != 0 {
+		t.Errorf("speed_limit after clear = %d, want 0", got2.SpeedLimit)
+	}
+}
+
+
+func TestIntegration_SubHostRoundTripAndPriorityOrder(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	nodes, inbounds, subHosts := st.Nodes(), st.Inbounds(), st.SubHosts()
+
+	node := &domain.Node{ID: uuid.New(), Name: "n1", Address: "1.2.3.4:50051", Core: domain.CoreXray, CreatedAt: time.Now()}
+	if err := nodes.Create(ctx, node); err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	in := &domain.Inbound{ID: uuid.New(), NodeID: node.ID, Tag: "vless-ws", Protocol: domain.ProtoVLESS, Port: 443, Network: "ws", Security: domain.SecurityTLS, Enabled: true}
+	if err := inbounds.Create(ctx, in); err != nil {
+		t.Fatalf("create inbound: %v", err)
+	}
+
+	// Host with every field populated, including a non-nil port.
+	port := 8443
+	full := &domain.SubHost{
+		ID: uuid.New(), InboundID: in.ID, Remark: "CDN {USERNAME}", Address: "cdn.example.com",
+		Port: &port, SNI: "sni.example.com", HostHeader: "host.example.com", Path: "/ws",
+		ALPN: "h2,http/1.1", Fingerprint: "chrome", Security: domain.HostSecurityTLS,
+		AllowInsecure: true, MuxEnable: true, Fragment: "100-200,10-20,1", Priority: 2,
+		Enabled: true, CreatedAt: time.Now(),
+	}
+	if err := subHosts.Create(ctx, full); err != nil {
+		t.Fatalf("create full host: %v", err)
+	}
+
+	got, err := subHosts.GetByID(ctx, full.ID)
+	if err != nil || got == nil {
+		t.Fatalf("get host: %v", err)
+	}
+	if got.Remark != "CDN {USERNAME}" || got.Address != "cdn.example.com" || got.Port == nil || *got.Port != 8443 ||
+		got.SNI != "sni.example.com" || got.HostHeader != "host.example.com" || got.Path != "/ws" ||
+		got.ALPN != "h2,http/1.1" || got.Fingerprint != "chrome" || got.Security != domain.HostSecurityTLS ||
+		!got.AllowInsecure || !got.MuxEnable || got.Fragment != "100-200,10-20,1" || !got.Enabled {
+		t.Errorf("host round-trip mismatch: %+v", got)
+	}
+
+	// Host with a nil port (inherit inbound port) and lower priority.
+	low := &domain.SubHost{
+		ID: uuid.New(), InboundID: in.ID, Remark: "direct", Address: "", Port: nil,
+		Security: domain.HostSecurityInboundDefault, Priority: 0, Enabled: true, CreatedAt: time.Now(),
+	}
+	if err := subHosts.Create(ctx, low); err != nil {
+		t.Fatalf("create low host: %v", err)
+	}
+	gotLow, err := subHosts.GetByID(ctx, low.ID)
+	if err != nil || gotLow == nil {
+		t.Fatalf("get low host: %v", err)
+	}
+	if gotLow.Port != nil {
+		t.Errorf("nil port did not round-trip: %+v", gotLow.Port)
+	}
+
+	// ListByInbound must come back ordered by priority ASC.
+	list, err := subHosts.ListByInbound(ctx, in.ID)
+	if err != nil {
+		t.Fatalf("list by inbound: %v", err)
+	}
+	if len(list) != 2 || list[0].ID != low.ID || list[1].ID != full.ID {
+		t.Errorf("priority order wrong: %+v", list)
+	}
+
+	// ListByInbounds batch variant returns both for the inbound set.
+	batch, err := subHosts.ListByInbounds(ctx, []uuid.UUID{in.ID})
+	if err != nil || len(batch) != 2 {
+		t.Errorf("list by inbounds = %d hosts err=%v, want 2", len(batch), err)
+	}
+
+	// Delete removes it.
+	if err := subHosts.Delete(ctx, full.ID); err != nil {
+		t.Fatalf("delete host: %v", err)
+	}
+	if after, _ := subHosts.ListByInbound(ctx, in.ID); len(after) != 1 {
+		t.Errorf("after delete = %d hosts, want 1", len(after))
+	}
+}

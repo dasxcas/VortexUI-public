@@ -1,0 +1,526 @@
+#!/usr/bin/env bash
+#
+# vortexui — management console for VortexUI. Works with both install methods:
+#   • docker  — the full Compose stack
+#   • native  — systemd panel/node + Caddy, with DB/Redis in Docker
+# Run bare (`vortexui`) for an interactive menu, or pass a subcommand
+# (`vortexui start`, `vortexui admin create ...`). Installed by install.sh.
+set -euo pipefail
+
+DIR="${VORTEXUI_DIR:-/opt/vortexui}"
+[ -d "$DIR" ] || { echo "VortexUI is not installed at $DIR" >&2; exit 1; }
+ENV_FILE="$DIR/deploy/.env"
+
+# Detect install role/method: node | native (panel) | docker (panel).
+PANEL_ENV="/etc/vortexui/panel.env"
+PANEL_BIN="/usr/local/bin/vortex-panel"
+if [ -f /etc/vortexui/node.env ] && [ -x /usr/local/bin/vortex-node ]; then
+  MODE=node
+elif [ -x "$PANEL_BIN" ] && [ -f "$PANEL_ENV" ]; then
+  MODE=native
+else
+  MODE=docker
+fi
+
+COMPOSE="docker compose --env-file $ENV_FILE -f $DIR/deploy/compose.yml"   # docker mode
+DEPS="docker compose -f $DIR/docker-compose.yml"                            # native deps (db+redis)
+
+g=$'\e[32m'; b=$'\e[34m'; y=$'\e[33m'; r=$'\e[31m'; d=$'\e[2m'; n=$'\e[0m'
+
+# --- helpers ------------------------------------------------------------------
+env_get()  { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-; }
+env_set()  {
+  if grep -qE "^$1=" "$ENV_FILE" 2>/dev/null; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"
+  else echo "$1=$2" >> "$ENV_FILE"; fi
+}
+public_host() { curl -fsS4 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo 127.0.0.1; }
+
+# Installs a pg_dump/pg_restore matching the DB's major version (pinned to
+# pg16 by the TimescaleDB image). Distro repos often ship an older client
+# (e.g. Ubuntu 22.04 -> pg14), and pg_dump refuses to talk to a newer server,
+# so a plain `apt install postgresql-client` is not enough -- pull from the
+# official PostgreSQL APT repo (PGDG) instead.
+ensure_pg_client() {
+  local want=16
+  if command -v pg_dump >/dev/null 2>&1; then
+    local have; have="$(pg_dump --version | grep -oE '[0-9]+' | head -1)"
+    [ "$have" = "$want" ] && return 0
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y && apt-get install -y postgresql-common curl ca-certificates gnupg || true
+    if [ -x /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh ]; then
+      yes | /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y || true
+    fi
+    apt-get update -y
+    apt-get install -y "postgresql-client-$want" || apt-get install -y postgresql-client
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y "postgresql${want}" || yum install -y postgresql
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache "postgresql${want}-client" || apk add --no-cache postgresql-client
+  fi
+}
+
+# Install or refresh the node agent binary. Nodes are usually installed from a
+# GitHub release tarball (no Go toolchain); fall back to source build only when
+# Go is available.
+install_node_binary() {
+  local arch sarch rel
+  arch="$(uname -m)"
+  case "$arch" in x86_64|amd64) sarch=amd64 ;; aarch64|arm64) sarch=arm64 ;; *)
+    echo "${r}unsupported architecture: $arch${n}" >&2; return 1 ;; esac
+  rel="$(curl -fsSL https://api.github.com/repos/iPmartNetwork/VortexUI/releases/latest \
+    | grep -oE '"tag_name": *"v[0-9.]+"' | head -1 | grep -oE 'v[0-9.]+' || true)"
+  if [ -n "$rel" ] && curl -fL -o /tmp/vortexui-node.tgz \
+      "https://github.com/iPmartNetwork/VortexUI/releases/download/${rel}/vortexui-node-linux-${sarch}.tar.gz" 2>/dev/null; then
+    tar -xzf /tmp/vortexui-node.tgz -C /tmp
+    install -m 0755 "/tmp/vortexui-node-linux-${sarch}" /usr/local/bin/vortex-node
+    rm -f /tmp/vortexui-node.tgz "/tmp/vortexui-node-linux-${sarch}"
+    return 0
+  fi
+  if command -v go >/dev/null 2>&1 || [ -x /usr/local/go/bin/go ]; then
+    export PATH="$PATH:/usr/local/go/bin"
+    ( cd "$DIR" && go build -o /usr/local/bin/vortex-node ./cmd/node )
+    return 0
+  fi
+  echo "${r}node update failed: no release binary and Go is not installed${n}" >&2
+  echo "  ${d}Nodes are normally installed without Go. Download a release binary manually or set VORTEXUI_GO_URL and re-run update.${n}" >&2
+  return 1
+}
+
+# Rewrite the native Caddyfile from the current .env and reload.
+write_caddy_native() {
+  local site email; site="$(env_get SITE_ADDRESS)"; email="$(env_get ACME_EMAIL)"
+  case "$site" in :*|"") site=":$(env_get WEB_PORT)";; esac
+  cat > /etc/caddy/Caddyfile <<EOF
+{
+	email ${email}
+}
+${site} {
+	encode gzip
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle /sub/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle /health {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle {
+		root * /var/www/vortexui
+		try_files {path} /index.html
+		file_server
+	}
+}
+EOF
+  systemctl restart caddy
+}
+
+show_settings() {
+  local host port site url; host="$(public_host)"; port="$(env_get WEB_PORT)"; port="${port:-80}"
+  site="$(env_get SITE_ADDRESS)"
+  case "$site" in ""|:*) url="http://$host:$port" ;; *) url="https://$site" ;; esac
+  echo
+  echo "  ${b}Panel URL:${n}   $url"
+  echo "  ${b}Install:${n}     $DIR  ${d}(${MODE})${n}"
+  echo "  ${b}Site addr:${n}   ${site:-:$port}"
+  echo
+  if [ "$MODE" = native ]; then
+    systemctl --no-pager --lines=0 status vortexui-panel caddy 2>/dev/null | grep -E "●|Active:" || true
+    $DEPS ps
+  else
+    $COMPOSE ps
+  fi
+}
+
+# --- actions (mode-aware) -----------------------------------------------------
+c_start() {
+  case "$MODE" in
+    node)   systemctl start vortexui-node ;;
+    native) $DEPS up -d; systemctl start vortexui-panel caddy ;;
+    *)      $COMPOSE up -d ;;
+  esac
+}
+c_stop() {
+  case "$MODE" in
+    node)   systemctl stop vortexui-node ;;
+    native) systemctl stop vortexui-panel caddy; $DEPS stop ;;
+    *)      $COMPOSE down ;;
+  esac
+}
+c_restart() {
+  case "$MODE" in
+    node)   systemctl restart vortexui-node ;;
+    native)
+      if systemctl is-enabled vortexui-panel 2>/dev/null | grep -q masked; then
+        echo "  ${y}service was masked — unmasking...${n}"
+        systemctl unmask vortexui-panel
+      fi
+      systemctl restart vortexui-panel caddy ;;
+    *)      $COMPOSE restart "$@" ;;
+  esac
+}
+c_status() {
+  case "$MODE" in
+    node)   systemctl --no-pager status vortexui-node 2>/dev/null | head -20 ;;
+    native) systemctl --no-pager status vortexui-panel caddy 2>/dev/null | head -20; $DEPS ps ;;
+    *)      $COMPOSE ps ;;
+  esac
+}
+c_logs() {
+  case "$MODE" in
+    node)   journalctl -u vortexui-node -f --no-pager ;;
+    native) journalctl -u "vortexui-${1:-panel}" -f --no-pager ;;
+    *)      $COMPOSE logs -f --tail=200 "$@" ;;
+  esac
+}
+c_update() {
+  local branch; branch="$(git -C "$DIR" rev-parse --abbrev-ref HEAD)"
+  git -C "$DIR" fetch origin "$branch"
+  git -C "$DIR" reset --hard "origin/$branch"
+  # Refresh the management CLI itself so CLI improvements land on update.
+  install -m 0755 "$DIR/scripts/vortexui" /usr/local/bin/vortexui 2>/dev/null || true
+  case "$MODE" in
+    node)
+      install_node_binary && systemctl restart vortexui-node
+      echo "${g}✓ node updated${n} — run ${b}vortexui doctor${n} to verify certs and agent port." ;;
+    native)
+      # -a ensures embedded SQL migrations are re-baked into the panel binary.
+      export PATH="$PATH:/usr/local/go/bin"
+      ( cd "$DIR" && go build -a -o /usr/local/bin/vortex-panel ./cmd/panel && install_node_binary )
+      ( cd "$DIR/web" && npm ci && npm run build && mkdir -p /var/www/vortexui && cp -r dist/* /var/www/vortexui/ )
+      # pg_dump/pg_restore power the "Full DB backup"/restore buttons; installs
+      # from before this was added won't have a version-matched client yet.
+      ensure_pg_client
+      # Refresh the systemd unit from the deploy template.
+      if [ -f "$DIR/deploy/vortexui-panel.service" ]; then
+        cp "$DIR/deploy/vortexui-panel.service" /etc/systemd/system/vortexui-panel.service
+      fi
+      # Ensure service file exists (unmask deletes it if it was a mask symlink)
+      if [ ! -f /etc/systemd/system/vortexui-panel.service ]; then
+        echo "  ${y}service file missing — recreating...${n}"
+        cp "$DIR/deploy/vortexui-panel.service" /etc/systemd/system/vortexui-panel.service
+      fi
+      systemctl daemon-reload
+      # Unmask if masked (must happen before enable or restart)
+      local svc_state
+      svc_state="$(systemctl is-enabled vortexui-panel 2>/dev/null || true)"
+      if [ "$svc_state" = "masked" ]; then
+        echo "  ${y}service was masked — unmasking...${n}"
+        systemctl unmask vortexui-panel
+        # Recreate service file since unmask removes the symlink
+        cp "$DIR/deploy/vortexui-panel.service" /etc/systemd/system/vortexui-panel.service
+        systemctl daemon-reload
+      fi
+      systemctl enable vortexui-panel 2>/dev/null || true
+      # Ensure DB and Redis containers are running before panel starts
+      $DEPS up -d
+      sleep 2
+      systemctl restart vortexui-panel caddy
+      echo "${g}✓ panel updated${n} — run ${b}vortexui doctor${n} to verify services, DB, and certs." ;;
+    *)      $COMPOSE up -d --build
+      echo "${g}✓ stack updated${n} — run ${b}vortexui doctor${n} for a quick health check." ;;
+  esac
+}
+
+# Run a 'panel admin ...' command in either mode.
+c_admin() {
+  if [ "$MODE" = native ]; then ( set -a; . "$PANEL_ENV"; set +a; "$PANEL_BIN" admin "$@" )
+  else $COMPOSE exec -T panel /usr/local/bin/panel admin "$@"; fi
+}
+
+c_create_admin() {
+  local u p
+  read -r -p "username: " u
+  read -r -s -p "password: " p; echo
+  [ -n "$u" ] && [ -n "$p" ] || { echo "${r}username and password required${n}"; return 1; }
+  c_admin create --username "$u" --password "$p" --sudo && echo "${g}✓ admin '$u' created${n}"
+}
+
+c_change_port() {
+  local p; read -r -p "new web port [current $(env_get WEB_PORT)]: " p
+  [[ "$p" =~ ^[0-9]+$ ]] || { echo "${r}invalid port${n}"; return 1; }
+  env_set WEB_PORT "$p"
+  if [ "$MODE" = native ]; then env_set SITE_ADDRESS ":$p"; write_caddy_native
+  else $COMPOSE up -d web; fi
+  echo "${g}✓ web now on port $p${n}"
+}
+
+c_set_domain() {
+  local domain email; read -r -p "domain/subdomain (blank = back to IP/HTTP): " domain
+  if [ -z "$domain" ]; then
+    env_set SITE_ADDRESS ":$(env_get WEB_PORT)"; env_set ACME_EMAIL ""
+    echo "${y}reverting to HTTP on port $(env_get WEB_PORT)${n}"
+  else
+    read -r -p "Let's Encrypt email (optional): " email
+    env_set SITE_ADDRESS "$domain"; env_set ACME_EMAIL "$email"
+    echo "${g}✓ domain set — make sure $domain points here and 80/443 are open${n}"
+  fi
+  if [ "$MODE" = native ]; then write_caddy_native; else $COMPOSE up -d web; fi
+}
+
+# Switch the local node's proxy engine between xray and sing-box.
+c_switch_core() {
+  local cur newcore cbin v2ray
+  if [ "$MODE" = docker ]; then
+    cur="$(env_get CORE)"; cur="${cur:-xray}"
+    echo "  current local-node core: ${g}${cur}${n}"
+    echo "   ${b}1)${n} xray      ${b}2)${n} sing-box"
+    read -r -p "  choose [1/2]: " c
+    case "$c" in
+      2) newcore=singbox; cbin=/usr/local/bin/sing-box; v2ray=false ;;
+      *) newcore=xray;    cbin=/usr/local/bin/xray;    v2ray=true ;;
+    esac
+    env_set CORE "$newcore"
+    if [ "$newcore" = singbox ]; then
+      env_set SINGBOX_V2RAY_API false
+    else
+      sed -i '/^SINGBOX_V2RAY_API=/d' "$ENV_FILE" 2>/dev/null || true
+    fi
+    echo "  ${b}rebuilding panel with $newcore…${n}"
+    $COMPOSE up -d --build panel
+    echo "${g}✓ docker local node now runs $newcore — give it a few seconds to start.${n}"
+    return
+  fi
+  if [ "$MODE" != native ]; then
+    echo "${y}core switch is available on panel installs (native or docker).${n}"; return
+  fi
+  cur="$(grep '^VORTEX_CORE=' "$PANEL_ENV" 2>/dev/null | cut -d= -f2-)"
+  echo "  current local-node core: ${g}${cur:-xray}${n}"
+  echo "   ${b}1)${n} xray      ${b}2)${n} sing-box"
+  read -r -p "  choose [1/2]: " c
+  case "$c" in
+    2) newcore=singbox; cbin=/usr/local/bin/sing-box; v2ray=false ;;
+    *) newcore=xray;    cbin=/usr/local/bin/xray;    v2ray=true ;;
+  esac
+  [ -x "$cbin" ] || { echo "${r}$cbin is not installed${n}"; return 1; }
+  if grep -q '^VORTEX_SINGBOX_V2RAY_API=' "$PANEL_ENV" 2>/dev/null; then
+    sed -i "s|^VORTEX_CORE=.*|VORTEX_CORE=$newcore|; s|^VORTEX_CORE_BIN=.*|VORTEX_CORE_BIN=$cbin|; s|^VORTEX_SINGBOX_V2RAY_API=.*|VORTEX_SINGBOX_V2RAY_API=$v2ray|" "$PANEL_ENV"
+  else
+    sed -i "s|^VORTEX_CORE=.*|VORTEX_CORE=$newcore|; s|^VORTEX_CORE_BIN=.*|VORTEX_CORE_BIN=$cbin|" "$PANEL_ENV"
+    echo "VORTEX_SINGBOX_V2RAY_API=$v2ray" >> "$PANEL_ENV"
+  fi
+  systemctl restart vortexui-panel
+  echo "${g}✓ local node now runs $newcore — give it a few seconds to start.${n}"
+}
+
+# Print a base64 mTLS enrollment bundle (ca.crt+node.crt+node.key) for a new node.
+c_node_bundle() {
+  if [ "$MODE" = node ]; then echo "  ${y}run this on the PANEL server, not on a node.${n}"; return 1; fi
+  local cdir="$DIR/deploy/certs" f
+  for f in ca.crt node.crt node.key; do
+    [ -f "$cdir/$f" ] || { echo "  ${r}missing $cdir/$f — generate certs first (re-run install).${n}"; return 1; }
+  done
+  echo
+  echo "  ${b}Node enrollment bundle${n} ${d}— copy the entire line below${n}"
+  echo "  ${d}On the new node: run the installer, choose Node, then paste it when prompted.${n}"
+  echo
+  tar -C "$cdir" -czf - ca.crt node.crt node.key | base64 -w0; echo
+  echo
+  echo "  ${d}Panel CA fingerprint (verify on the node after install):${n}"
+  openssl x509 -in "$cdir/ca.crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/sha256 Fingerprint=//' || true
+}
+
+# Run connectivity and service checks; prints actionable hints on failure.
+c_doctor() {
+  local ok=0 fail=0 warn=0
+  pass() { echo "  ${g}✓${n} $1"; ok=$((ok+1)); }
+  fail_msg() { echo "  ${r}✗${n} $1"; fail=$((fail+1)); }
+  warn_msg() { echo "  ${y}!${n} $1"; warn=$((warn+1)); }
+
+  echo
+  echo "  ${b}VortexUI doctor${n} ${d}(${MODE} install at $DIR)${n}"
+  echo "  ${d}────────────────────────────────${n}"
+
+  case "$MODE" in
+    node)
+      [ -f /etc/vortexui/node.env ] && pass "node.env present" || fail_msg "missing /etc/vortexui/node.env"
+      [ -x /usr/local/bin/vortex-node ] && pass "vortex-node binary" || fail_msg "vortex-node missing"
+      for f in ca.crt node.crt node.key; do
+        [ -f "/etc/vortexui/certs/$f" ] && pass "cert $f" || fail_msg "missing /etc/vortexui/certs/$f"
+      done
+      if [ -f /etc/vortexui/certs/ca.crt ]; then
+        echo "     ${d}CA fingerprint:${n} $(openssl x509 -in /etc/vortexui/certs/ca.crt -noout -fingerprint -sha256 2>/dev/null | sed 's/sha256 Fingerprint=//')"
+      fi
+      systemctl is-active --quiet vortexui-node && pass "vortexui-node service running" || fail_msg "vortexui-node not running (systemctl status vortexui-node)"
+      ss -tln 2>/dev/null | grep -q ':50051' && pass "agent listening on :50051" || fail_msg "nothing listening on :50051"
+      core="$(grep '^VORTEX_CORE=' /etc/vortexui/node.env 2>/dev/null | cut -d= -f2-)"
+      core="${core:-xray}"
+      cbin="$(grep '^VORTEX_CORE_BIN=' /etc/vortexui/node.env 2>/dev/null | cut -d= -f2-)"
+      case "$core" in
+        singbox) cbin="${cbin:-/usr/local/bin/sing-box}" ;;
+        *)       cbin="${cbin:-/usr/local/bin/xray}" ;;
+      esac
+      [ -x "$cbin" ] && pass "core binary ($core)" || fail_msg "core binary missing: $cbin"
+      v2api="$(grep '^VORTEX_SINGBOX_V2RAY_API=' /etc/vortexui/node.env 2>/dev/null | cut -d= -f2-)"
+      if [ "$core" = singbox ] && [ "$v2api" = true ]; then
+        warn_msg "VORTEX_SINGBOX_V2RAY_API=true — stock sing-box rejects v2ray_api (set false)"
+      fi
+      ;;
+    native)
+      [ -f "$PANEL_ENV" ] && pass "panel.env present" || fail_msg "missing $PANEL_ENV"
+      [ -x "$PANEL_BIN" ] && pass "vortex-panel binary" || fail_msg "vortex-panel missing"
+      cdir="$DIR/deploy/certs"
+      for f in ca.crt panel.crt panel.key node.crt node.key; do
+        [ -f "$cdir/$f" ] && pass "cert $f" || fail_msg "missing $cdir/$f"
+      done
+      if [ -f "$cdir/ca.crt" ]; then
+        echo "     ${d}Panel CA fingerprint:${n} $(openssl x509 -in "$cdir/ca.crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/sha256 Fingerprint=//')"
+      fi
+      systemctl is-active --quiet vortexui-panel && pass "vortexui-panel running" || fail_msg "vortexui-panel not running"
+      systemctl is-active --quiet caddy && pass "caddy running" || warn_msg "caddy not running"
+      ss -tln 2>/dev/null | grep -q ':8080' && pass "panel API on :8080" || fail_msg "panel API not listening on :8080"
+      $DEPS ps 2>/dev/null | grep -qE 'postgres|db' && pass "postgres container up" || fail_msg "postgres container down ($DEPS ps)"
+      $DEPS ps 2>/dev/null | grep -q redis && pass "redis container up" || warn_msg "redis container down"
+      curl -fsS http://127.0.0.1:8080/api/health >/dev/null 2>&1 && pass "GET /api/health OK" || fail_msg "GET /api/health failed"
+      if command -v pg_dump >/dev/null 2>&1; then
+        pgver="$(pg_dump --version | grep -oE '[0-9]+' | head -1)"
+        if [ "$pgver" = "16" ]; then
+          pass "pg_dump v16 available (full DB backup)"
+        else
+          warn_msg "pg_dump v$pgver found but DB is v16 — run 'vortexui update' to install a matching client"
+        fi
+      else
+        warn_msg "pg_dump not installed — 'Full DB backup'/restore will fail; run 'vortexui update'"
+      fi
+      mig_files=$(find "$DIR/migrations" -maxdepth 1 -name '*.sql' 2>/dev/null | wc -l | tr -d ' ')
+      mig_db=$($DEPS exec -T db psql -U vortex -d vortex -tAc "SELECT COUNT(*) FROM goose_db_version" 2>/dev/null | tr -d ' ')
+      if [ -n "$mig_files" ] && [ -n "$mig_db" ] && [ "$mig_db" -ge "$mig_files" ]; then
+        pass "DB migrations applied ($mig_db records, $mig_files embedded)"
+      elif [ "$mig_db" -lt "$mig_files" ] 2>/dev/null; then
+        fail_msg "pending migrations (db=$mig_db, embedded=$mig_files) — restart vortexui-panel to apply"
+      elif [ -n "$mig_db" ]; then
+        warn_msg "DB has extra migration records (db=$mig_db, embedded=$mig_files) — usually harmless"
+      else
+        warn_msg "could not verify DB migrations"
+      fi
+      core="$(grep '^VORTEX_CORE=' "$PANEL_ENV" 2>/dev/null | cut -d= -f2-)"
+      core="${core:-xray}"
+      cbin="$(grep '^VORTEX_CORE_BIN=' "$PANEL_ENV" 2>/dev/null | cut -d= -f2-)"
+      case "$core" in
+        singbox) cbin="${cbin:-/usr/local/bin/sing-box}" ;;
+        *)       cbin="${cbin:-/usr/local/bin/xray}" ;;
+      esac
+      [ -x "$cbin" ] && pass "local core binary ($core)" || fail_msg "local core binary missing: $cbin"
+      v2api="$(grep '^VORTEX_SINGBOX_V2RAY_API=' "$PANEL_ENV" 2>/dev/null | cut -d= -f2-)"
+      if [ "$core" = singbox ] && [ "$v2api" = true ]; then
+        warn_msg "VORTEX_SINGBOX_V2RAY_API=true — stock sing-box rejects v2ray_api (set false)"
+      fi
+      ;;
+    *)
+      $COMPOSE ps 2>/dev/null | grep -q panel && pass "compose stack up" || fail_msg "compose stack not running"
+      curl -fsS http://127.0.0.1:"$(env_get WEB_PORT)"/health >/dev/null 2>&1 && pass "GET /health OK" || warn_msg "GET /health failed (check WEB_PORT in .env)"
+      ;;
+  esac
+
+  echo
+  echo "  ${d}Summary:${n} ${g}$ok passed${n}, ${r}$fail failed${n}, ${y}$warn warnings${n}"
+  if [ "$fail" -gt 0 ]; then
+    echo "  ${y}Tip:${n} for node mTLS issues, compare CA fingerprints on panel and node."
+    echo "       Panel: ${b}vortexui node-bundle${n}  ·  Node: ${b}openssl x509 -in /etc/vortexui/certs/ca.crt -noout -fingerprint -sha256${n}"
+    return 1
+  fi
+  return 0
+}
+
+c_uninstall() {
+  read -r -p "${r}Remove everything incl. volumes (data loss)?${n} [y/N] " a
+  [ "$a" = "y" ] || [ "$a" = "Y" ] || { echo "aborted."; return 0; }
+  # Don't let one failing step abort the rest of the teardown.
+  set +e
+  case "$MODE" in
+    node)
+      systemctl disable --now vortexui-node 2>/dev/null
+      rm -f /etc/systemd/system/vortexui-node.service; systemctl daemon-reload
+      rm -rf /usr/local/bin/vortex-node /etc/vortexui ;;
+    native)
+      systemctl disable --now vortexui-panel 2>/dev/null
+      rm -f /etc/systemd/system/vortexui-panel.service; systemctl daemon-reload
+      systemctl disable --now caddy 2>/dev/null
+      $DEPS down -v 2>/dev/null
+      rm -rf /usr/local/bin/vortex-panel /usr/local/bin/vortex-node /etc/vortexui /var/www/vortexui /etc/caddy/Caddyfile ;;
+    *)
+      $COMPOSE down -v 2>/dev/null ;;
+  esac
+  rm -f /usr/local/bin/vortexui
+  set -e
+  echo "${g}✓ Removed.${n} Source remains at $DIR (delete with: rm -rf $DIR)."
+}
+
+usage() {
+  cat <<EOF
+vortexui — manage the VortexUI stack (${MODE} install)
+
+  vortexui                     interactive menu
+  vortexui start|stop|restart  control services
+  vortexui status              service status
+  vortexui logs [panel|caddy]  follow logs
+  vortexui update              pull latest and rebuild
+  vortexui admin ...           run 'panel admin' (create / reset-password)
+  vortexui node-bundle         print an mTLS enrollment bundle for a new node
+  vortexui doctor              check certs, services, ports, and connectivity
+  vortexui settings            show URL / port / status
+  vortexui uninstall           remove the stack (DELETES data)
+EOF
+}
+
+# --- interactive menu ---------------------------------------------------------
+menu() {
+  while true; do
+    echo
+    echo "  ${g}VortexUI${n} ${d}· management console (${MODE})${n}"
+    echo "  ${d}────────────────────────────${n}"
+    echo "   ${b}1)${n} Start            ${b}2)${n} Stop"
+    echo "   ${b}3)${n} Restart          ${b}4)${n} Status"
+    echo "   ${b}5)${n} Logs             ${b}6)${n} Update"
+    if [ "$MODE" = node ]; then
+      echo "   ${b}14)${n} Doctor           ${b}11)${n} ${r}Uninstall${n}      ${b}0)${n} Exit"
+    else
+      echo "   ${b}7)${n} Create admin     ${b}8)${n} Change web port"
+      echo "   ${b}9)${n} Domain / SSL     ${b}10)${n} Settings / URL"
+      echo "   ${b}12)${n} Switch core      ${b}13)${n} Node enroll bundle"
+      echo "   ${b}14)${n} Doctor           ${b}11)${n} ${r}Uninstall${n}       ${b}0)${n} Exit"
+    fi
+    echo
+    read -r -p "  choose: " choice
+    case "$choice" in
+      1) c_start ;;
+      2) c_stop ;;
+      3) c_restart ;;
+      4) c_status ;;
+      5) c_logs ;;
+      6) c_update ;;
+      7) [ "$MODE" = node ] && echo "  ${y}n/a on a node${n}" || c_create_admin ;;
+      8) [ "$MODE" = node ] && echo "  ${y}n/a on a node${n}" || c_change_port ;;
+      9) [ "$MODE" = node ] && echo "  ${y}n/a on a node${n}" || c_set_domain ;;
+      10) [ "$MODE" = node ] && c_status || show_settings ;;
+      11) c_uninstall; exit 0 ;;
+      12) [ "$MODE" = node ] && echo "  ${y}n/a on a node${n}" || c_switch_core ;;
+      13) [ "$MODE" = node ] && echo "  ${y}n/a on a node${n}" || c_node_bundle ;;
+      14) c_doctor ;;
+      0) exit 0 ;;
+      *) echo "  ${y}invalid choice${n}" ;;
+    esac
+  done
+}
+
+# --- dispatch -----------------------------------------------------------------
+cmd="${1:-}"; [ $# -gt 0 ] && shift || true
+case "$cmd" in
+  "")                 menu ;;
+  start)              c_start ;;
+  stop)               c_stop ;;
+  restart)            c_restart "$@" ;;
+  status|ps)          c_status ;;
+  logs)               c_logs "$@" ;;
+  update)             c_update ;;
+  admin)              c_admin "$@" ;;
+  settings)           show_settings ;;
+  core)               c_switch_core ;;
+  node-bundle)        c_node_bundle ;;
+  doctor)             c_doctor ;;
+  uninstall)          c_uninstall ;;
+  menu)               menu ;;
+  -h|--help|help)     usage ;;
+  *) echo "unknown command: $cmd" >&2; usage; exit 1 ;;
+esac

@@ -1,0 +1,559 @@
+// Package hub is the panel's control plane over the fleet of nodes. It owns one
+// long-lived connection per node, continuously drains each node's traffic stream
+// into the stats aggregator, polls health for failover, and fans configuration
+// and user mutations out to nodes. Everything below the NodeConn interface is
+// transport detail, so the hub is fully testable with in-memory fakes.
+package hub
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/vortexui/vortexui/internal/core"
+	"github.com/vortexui/vortexui/internal/domain"
+	"github.com/vortexui/vortexui/internal/panel/port"
+)
+
+// NodeConn is the hub's view of a single node link. *grpc.NodeClient satisfies
+// it; tests supply a fake. Keeping this narrow lets the hub stay transport-agnostic.
+type NodeConn interface {
+	Sync(ctx context.Context, cfg *core.GeneratedConfig, coreType domain.CoreType) error
+	AddUser(ctx context.Context, inboundTag string, u *domain.User) error
+	RemoveUser(ctx context.Context, inboundTag string, userID uuid.UUID) error
+	Health(ctx context.Context) (domain.NodeHealth, error)
+	ConsumeTraffic(ctx context.Context, ingest func(domain.TrafficDelta)) error
+	OnlineStats(ctx context.Context) (map[string]int, error)
+	OnlineIPs(ctx context.Context, userID string) (map[string]int64, error)
+	UpdateGeo(ctx context.Context, geoipURL, geositeURL string) (geoip, geosite int64, err error)
+	Logs(ctx context.Context, limit int) ([]string, error)
+	RestartCore(ctx context.Context) error
+	StopCore(ctx context.Context) error
+	InstallCertificate(ctx context.Context, certPEM, keyPEM []byte, fingerprint string) error
+	InstallCore(ctx context.Context, core, version, url, sha string, allowUnverified bool) error
+	UpgradeAgent(ctx context.Context, url, sha string) error
+	Probe(ctx context.Context, target string, timeout time.Duration) (ok bool, latency time.Duration, errMsg string, err error)
+	Close() error
+}
+
+// Dialer establishes a connection to a node (mTLS gRPC in production).
+type Dialer func(node *domain.Node) (NodeConn, error)
+
+// FailoverFunc is invoked when a node is declared unhealthy, with a healthy
+// target chosen by the hub (or nil if none is available). The higher layer (user
+// service) performs the actual user migration; the hub only detects and routes.
+type FailoverFunc func(ctx context.Context, failed *domain.Node, target *domain.Node)
+
+// DisconnectAlertFunc fires once when a node stays unreachable for a prolonged
+// period (default 5 minutes), carrying the latest diagnostics snapshot.
+type DisconnectAlertFunc func(ctx context.Context, node *domain.Node, diag domain.NodeDiagnostics, since time.Duration)
+
+// AutoRecoverFunc fires when the hub automatically restarts a core or resets
+// connections to recover from a prolonged unhealthy state.
+type AutoRecoverFunc func(ctx context.Context, node *domain.Node, action string)
+
+// ReadyFunc is invoked when a node's agent becomes reachable (initial connect or
+// after a reconnect). The higher layer uses it to push the node's full desired
+// config, so a restarted node is repopulated automatically.
+type ReadyFunc func(ctx context.Context, node *domain.Node)
+
+// RecentTrafficCounter counts users with recent traffic on one node. Used as a
+// fallback when the core's live online-stats API is empty or unavailable.
+type RecentTrafficCounter interface {
+	CountRecentActive(ctx context.Context, nodeID uuid.UUID, window time.Duration) (int, error)
+}
+
+// Options configures a Hub.
+type Options struct {
+	Dialer         Dialer
+	Nodes          port.NodeRepository
+	Ingest         func(domain.TrafficDelta) // usually stats.Aggregator.Ingest
+	OnFailover     FailoverFunc
+	OnConnect      ReadyFunc // called when a node (re)connects; usually a resync
+	OnDisconnectAlert DisconnectAlertFunc
+	OnAutoRecover  AutoRecoverFunc
+	HealthInterval time.Duration
+
+	// Fallback live-connection signal when OnlineStats is empty/unavailable.
+	RecentTraffic       RecentTrafficCounter
+	RecentTrafficWindow time.Duration
+
+	// SecurityIngest handles probe/fingerprint events parsed from node logs.
+	SecurityIngest SecurityIngest
+
+	// Automatic recovery when nodes stay unhealthy without manual intervention.
+	AutoRecoverCore         bool
+	AutoRecoverCoreAfter    time.Duration
+	AutoRecoverCoreCooldown time.Duration
+	AutoRecoverHub          bool
+	AutoRecoverHubAfter     time.Duration
+	AutoRecoverHubCooldown  time.Duration
+
+	Logger         *slog.Logger
+}
+
+// Hub manages the node fleet.
+type Hub struct {
+	opts  Options
+	log   *slog.Logger
+	mu    sync.RWMutex
+	conns map[uuid.UUID]*managedNode
+
+	failoverFn FailoverFunc // guarded by mu; settable post-construction
+	onConnect  ReadyFunc    // guarded by mu; settable post-construction
+	onDisconnectAlert DisconnectAlertFunc
+	onAutoRecover     AutoRecoverFunc
+
+	lastHubRecover time.Time
+}
+
+// New builds a Hub, applying defaults.
+func New(opts Options) *Hub {
+	if opts.HealthInterval == 0 {
+		opts.HealthInterval = 10 * time.Second
+	}
+	if opts.AutoRecoverCoreAfter == 0 {
+		opts.AutoRecoverCoreAfter = 2 * time.Minute
+	}
+	if opts.AutoRecoverCoreCooldown == 0 {
+		opts.AutoRecoverCoreCooldown = 5 * time.Minute
+	}
+	if opts.AutoRecoverHubAfter == 0 {
+		opts.AutoRecoverHubAfter = 5 * time.Minute
+	}
+	if opts.AutoRecoverHubCooldown == 0 {
+		opts.AutoRecoverHubCooldown = 10 * time.Minute
+	}
+	if opts.RecentTrafficWindow == 0 {
+		opts.RecentTrafficWindow = 2 * time.Minute
+	}
+	if opts.Ingest == nil {
+		opts.Ingest = func(domain.TrafficDelta) {}
+	}
+	if opts.OnFailover == nil {
+		opts.OnFailover = func(context.Context, *domain.Node, *domain.Node) {}
+	}
+	if opts.OnConnect == nil {
+		opts.OnConnect = func(context.Context, *domain.Node) {}
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	return &Hub{
+		opts: opts, log: opts.Logger, conns: make(map[uuid.UUID]*managedNode),
+		failoverFn: opts.OnFailover, onConnect: opts.OnConnect,
+		onAutoRecover: opts.OnAutoRecover,
+	}
+}
+
+// SetOnFailover replaces the failover handler after construction. This breaks the
+// chicken-and-egg between the hub and the migration service (which needs the hub
+// as its provisioner): build the hub, build the service with it, then wire this.
+func (h *Hub) SetOnFailover(fn FailoverFunc) {
+	if fn == nil {
+		return
+	}
+	h.mu.Lock()
+	h.failoverFn = fn
+	h.mu.Unlock()
+}
+
+func (h *Hub) failover() FailoverFunc {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.failoverFn
+}
+
+// SetOnConnect replaces the (re)connect handler after construction, mirroring
+// SetOnFailover (the resync handler needs the hub as its Syncer).
+func (h *Hub) SetOnConnect(fn ReadyFunc) {
+	if fn == nil {
+		return
+	}
+	h.mu.Lock()
+	h.onConnect = fn
+	h.mu.Unlock()
+}
+
+func (h *Hub) connectHook() ReadyFunc {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.onConnect
+}
+
+// SetOnDisconnectAlert wires prolonged-disconnect notifications (Telegram/webhook).
+func (h *Hub) SetOnDisconnectAlert(fn DisconnectAlertFunc) {
+	if fn == nil {
+		return
+	}
+	h.mu.Lock()
+	h.onDisconnectAlert = fn
+	h.mu.Unlock()
+}
+
+func (h *Hub) disconnectAlert() DisconnectAlertFunc {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.onDisconnectAlert
+}
+
+// SetOnAutoRecover wires automatic recovery notifications.
+func (h *Hub) SetOnAutoRecover(fn AutoRecoverFunc) {
+	if fn == nil {
+		return
+	}
+	h.mu.Lock()
+	h.onAutoRecover = fn
+	h.mu.Unlock()
+}
+
+func (h *Hub) autoRecoverHook() AutoRecoverFunc {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.onAutoRecover
+}
+
+// StartWatchdog runs background checks for fleet-wide recovery (e.g. resetting
+// all hub connections when every node stays unreachable).
+func (h *Hub) StartWatchdog(ctx context.Context) {
+	if !h.opts.AutoRecoverHub {
+		return
+	}
+	go h.runHubWatchdog(ctx)
+}
+
+// SetSecurityIngest wires probe/fingerprint ingestion from node log polling.
+func (h *Hub) SetSecurityIngest(fn SecurityIngest) {
+	h.mu.Lock()
+	h.opts.SecurityIngest = fn
+	h.mu.Unlock()
+}
+
+// Register brings a node under management: it dials, then starts the traffic and
+// health loops. Re-registering an already-managed node is a no-op.
+//
+// The traffic/health loops deliberately do NOT inherit the caller's ctx: callers
+// commonly invoke Register from an HTTP request handler (e.g. node create/update),
+// whose context is cancelled the moment that request finishes. Tying the
+// long-lived loops to it would silently kill them within moments of a node
+// edit — no error, no log, just a permanently "pending" node until the next
+// panel restart. The only supported ways to stop these loops are Deregister
+// and Close, both of which call managedNode.stop explicitly.
+func (h *Hub) Register(ctx context.Context, node *domain.Node) error {
+	_ = ctx // kept for interface stability; loop lifetime is Deregister/Close-controlled.
+	h.mu.Lock()
+	if _, exists := h.conns[node.ID]; exists {
+		h.mu.Unlock()
+		return nil
+	}
+	mn := &managedNode{node: node, hub: h, status: domain.NodeDisconnected}
+	h.conns[node.ID] = mn
+	h.mu.Unlock()
+
+	loopCtx, cancel := context.WithCancel(context.Background())
+	mn.cancel = cancel
+	go mn.runTraffic(loopCtx)
+	go mn.runSecurity(loopCtx)
+	go mn.runHealth(loopCtx)
+	return nil
+}
+
+// Deregister stops managing a node and closes its connection.
+func (h *Hub) Deregister(nodeID uuid.UUID) {
+	h.mu.Lock()
+	mn := h.conns[nodeID]
+	delete(h.conns, nodeID)
+	h.mu.Unlock()
+	if mn != nil {
+		mn.stop()
+	}
+}
+
+// Sync pushes desired state to one node. It uses ensureConn (not connection) so
+// it (re)dials if the cached connection was transiently dropped — critical for
+// the in-process local node, whose traffic loop drops the shared connection
+// while its core is still starting, which would otherwise leave a freshly-booted
+// local node unable to ever sync its config (and thus never start the core).
+func (h *Hub) Sync(ctx context.Context, nodeID uuid.UUID, cfg *core.GeneratedConfig) error {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return err
+	}
+	conn, err := mn.ensureConn()
+	if err != nil {
+		return err
+	}
+	for i := range cfg.Inbounds {
+		cfg.Inbounds[i].Core = mn.node.ResolveInboundCore(cfg.Inbounds[i].Core)
+	}
+	return conn.Sync(ctx, cfg, mn.node.SyncCoreType())
+}
+
+// AddUser provisions a user on one node's inbound at runtime.
+func (h *Hub) AddUser(ctx context.Context, nodeID uuid.UUID, inboundTag string, u *domain.User) error {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return err
+	}
+	conn, err := mn.ensureConn()
+	if err != nil {
+		return err
+	}
+	return conn.AddUser(ctx, inboundTag, u)
+}
+
+// RemoveUser deprovisions a user from one node's inbound at runtime.
+func (h *Hub) RemoveUser(ctx context.Context, nodeID uuid.UUID, inboundTag string, userID uuid.UUID) error {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return err
+	}
+	conn, err := mn.ensureConn()
+	if err != nil {
+		return err
+	}
+	return conn.RemoveUser(ctx, inboundTag, userID)
+}
+
+// InstallCertificate delivers a new TLS identity to one node's agent.
+func (h *Hub) InstallCertificate(ctx context.Context, nodeID uuid.UUID, certPEM, keyPEM []byte, fingerprint string) error {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return err
+	}
+	conn, err := mn.ensureConn()
+	if err != nil {
+		return err
+	}
+	return conn.InstallCertificate(ctx, certPEM, keyPEM, fingerprint)
+}
+
+// InstallCore asks one node to install a core artifact and restart its engine.
+func (h *Hub) InstallCore(ctx context.Context, nodeID uuid.UUID, core, version, url, sha string, allowUnverified bool) error {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return err
+	}
+	conn, err := mn.ensureConn()
+	if err != nil {
+		return err
+	}
+	return conn.InstallCore(ctx, core, version, url, sha, allowUnverified)
+}
+
+// UpgradeAgent asks one node to replace its own agent binary.
+func (h *Hub) UpgradeAgent(ctx context.Context, nodeID uuid.UUID, url, sha string) error {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return err
+	}
+	conn, err := mn.ensureConn()
+	if err != nil {
+		return err
+	}
+	return conn.UpgradeAgent(ctx, url, sha)
+}
+
+// Probe asks a node to dial a TCP target, so a relay path is checked from the
+// side that actually has to traverse it.
+func (h *Hub) Probe(ctx context.Context, nodeID uuid.UUID, target string, timeout time.Duration) (bool, time.Duration, string, error) {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return false, 0, "", err
+	}
+	conn, err := mn.ensureConn()
+	if err != nil {
+		return false, 0, "", err
+	}
+	return conn.Probe(ctx, target, timeout)
+}
+
+// Status returns the live status/health snapshot of a managed node.
+func (h *Hub) Status(nodeID uuid.UUID) (domain.NodeStatus, domain.NodeHealth, error) {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return "", domain.NodeHealth{}, err
+	}
+	st, hl, _ := mn.snapshot()
+	return st, hl, nil
+}
+
+// Live returns the hub's live status, health, and diagnostics for one node.
+func (h *Hub) Live(nodeID uuid.UUID) (domain.NodeStatus, domain.NodeHealth, domain.NodeDiagnostics, bool) {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return "", domain.NodeHealth{}, domain.NodeDiagnostics{}, false
+	}
+	st, hl, d := mn.snapshot()
+	return st, hl, d, true
+}
+
+// TestConnect dials a node once and returns connectivity diagnostics without
+// altering the managed connection cache.
+func (h *Hub) TestConnect(ctx context.Context, node *domain.Node) domain.NodeDiagnostics {
+	netOK := probeNetwork(ctx, node.Address)
+	if h.opts.Dialer == nil {
+		now := time.Now()
+		return domain.NodeDiagnostics{
+			Code: domain.NodeDiagUnknown, Message: "dialer not configured",
+			NetworkReachable: netOK, CAMatch: false, CheckedAt: &now,
+		}
+	}
+	if !netOK {
+		now := time.Now()
+		return domain.NodeDiagnostics{
+			Code: domain.NodeDiagUnreachable, Message: "TCP port unreachable from panel",
+			NetworkReachable: false, CAMatch: false, CheckedAt: &now,
+		}
+	}
+	conn, err := h.opts.Dialer(node)
+	if err != nil {
+		return buildDiagnostics(err, true)
+	}
+	defer func() { _ = conn.Close() }()
+	hctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	health, err := conn.Health(hctx)
+	if err != nil {
+		return buildDiagnostics(err, true)
+	}
+	if !health.CoreRunning {
+		now := time.Now()
+		return domain.NodeDiagnostics{
+			Code:             domain.NodeDiagCoreDown,
+			Message:          "agent reachable but proxy core is not running",
+			NetworkReachable: true,
+			CAMatch:          true,
+			CheckedAt:        &now,
+		}
+	}
+	return buildDiagnostics(nil, true)
+}
+
+// OnlineStats returns one node's live per-user connection counts.
+func (h *Hub) OnlineStats(ctx context.Context, nodeID uuid.UUID) (map[string]int, error) {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := mn.connection()
+	if err != nil {
+		return nil, err
+	}
+	return conn.OnlineStats(ctx)
+}
+
+// OnlineIPs returns the distinct source IPs currently online for one user on a
+// node, mapped to each IP's last-seen unix time.
+func (h *Hub) OnlineIPs(ctx context.Context, nodeID uuid.UUID, userID string) (map[string]int64, error) {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := mn.connection()
+	if err != nil {
+		return nil, err
+	}
+	return conn.OnlineIPs(ctx, userID)
+}
+
+// UpdateGeo asks one node to refresh its geoip/geosite routing databases.
+func (h *Hub) UpdateGeo(ctx context.Context, nodeID uuid.UUID, geoipURL, geositeURL string) (geoip, geosite int64, err error) {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return 0, 0, err
+	}
+	conn, err := mn.connection()
+	if err != nil {
+		return 0, 0, err
+	}
+	return conn.UpdateGeo(ctx, geoipURL, geositeURL)
+}
+
+// Logs returns up to limit recent core log lines from one node.
+func (h *Hub) Logs(ctx context.Context, nodeID uuid.UUID, limit int) ([]string, error) {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := mn.connection()
+	if err != nil {
+		return nil, err
+	}
+	return conn.Logs(ctx, limit)
+}
+
+// RestartCore restarts a node's proxy engine.
+func (h *Hub) RestartCore(ctx context.Context, nodeID uuid.UUID) error {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return err
+	}
+	conn, err := mn.connection()
+	if err != nil {
+		return err
+	}
+	return conn.RestartCore(ctx)
+}
+
+// StopCore stops a node's proxy engine.
+func (h *Hub) StopCore(ctx context.Context, nodeID uuid.UUID) error {
+	mn, err := h.managed(nodeID)
+	if err != nil {
+		return err
+	}
+	conn, err := mn.connection()
+	if err != nil {
+		return err
+	}
+	return conn.StopCore(ctx)
+}
+
+// HealthyNodes returns a snapshot of currently-healthy managed nodes, used for
+// failover target selection.
+func (h *Hub) HealthyNodes() []*domain.Node {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	var out []*domain.Node
+	for _, mn := range h.conns {
+		mn.mu.Lock()
+		healthy := mn.status == domain.NodeConnected && mn.health.CoreRunning
+		n := *mn.node
+		n.Health = mn.health
+		n.Status = mn.status
+		mn.mu.Unlock()
+		if healthy {
+			nn := n
+			out = append(out, &nn)
+		}
+	}
+	return out
+}
+
+// Close tears down all managed connections.
+func (h *Hub) Close() {
+	h.mu.Lock()
+	conns := h.conns
+	h.conns = make(map[uuid.UUID]*managedNode)
+	h.mu.Unlock()
+	for _, mn := range conns {
+		mn.stop()
+	}
+}
+
+func (h *Hub) managed(nodeID uuid.UUID) (*managedNode, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	mn, ok := h.conns[nodeID]
+	if !ok {
+		return nil, fmt.Errorf("node %s not managed", nodeID)
+	}
+	return mn, nil
+}
+
+var errNotConnected = errors.New("node not connected")

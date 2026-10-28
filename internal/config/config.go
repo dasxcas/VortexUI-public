@@ -1,0 +1,405 @@
+// Package config loads strongly-typed configuration from environment variables
+// with sane defaults. Fail-fast validation at startup is preferred over
+// discovering a missing secret at request time.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// DefaultCoreBin returns the conventional install path for a core engine name.
+func DefaultCoreBin(core string) string {
+	switch core {
+	case "singbox":
+		return "/usr/local/bin/sing-box"
+	case "xray":
+		return "/usr/local/bin/xray"
+	default:
+		return core
+	}
+}
+
+func defaultSingboxV2RayAPI(core string) bool {
+	return core != "singbox"
+}
+
+func singboxV2RayAPIFromEnv(core string) bool {
+	if v, ok := envBoolUnset("VORTEX_SINGBOX_V2RAY_API"); ok {
+		return v
+	}
+	return defaultSingboxV2RayAPI(core)
+}
+
+// Panel holds control-plane configuration.
+type Panel struct {
+	HTTPAddr    string
+	GRPCAddr    string // hub listener for node agents
+	DatabaseURL string
+	RedisURL    string
+	JWTSecret   string
+	JWTTTL      time.Duration
+
+	// mTLS material for the node hub.
+	TLSCert string
+	TLSKey  string
+	TLSCA   string
+
+	// Optional outbound notifications (empty = disabled).
+	WebhookURL        string
+	WebhookSecret     string
+	TelegramToken     string
+	TelegramChatID    string
+	TelegramUserToken string // end-user bot; needs its own bot token
+	PublicURL         string // public origin used to build subscription links
+	InitToken         string // when set, POST /api/admin/init requires this header
+	MetricsPublic     bool   // serve /metrics without auth (opt-in only)
+	// Personal disables the commercial surface (plans, shop, payments, orders,
+	// wallet, resellers, referrals, tickets). Single-operator installs do not
+	// want a shop they will never open.
+	Personal bool
+
+	// CoreBuild lets the panel compile metered core builds (sing-box with
+	// with_v2ray_api) in a throwaway container. Off by default: it needs Docker
+	// and a few minutes of CPU.
+	CoreBuild bool
+	// CoreDataDir is where built artifacts live and are served from.
+	CoreDataDir string
+	// BundledMetered is the path to the metering sing-box that ships inside the
+	// panel image (empty when the image has none).
+	BundledMetered string
+	// AgentDir holds the node agent binary served by /downloads/agent, so a new
+	// node can install itself without reaching GitHub.
+	AgentDir string
+
+	// Optional Cloudflare DNS automation (auto-create A records for nodes).
+	CloudflareToken  string
+	CloudflareZoneID string
+
+	// Optional in-process local node: run a proxy core on the panel host itself,
+	// managed in-process (no gRPC agent). Empty/false = disabled.
+	LocalNode     bool
+	LocalNodeName string   // node name/identity in the DB (default "local")
+	LocalNodeHost string   // public host advertised in subscriptions (default 127.0.0.1)
+	Core          string   // xray | singbox
+	EnabledCores  []string // when len>1 local node uses CompositeDriver
+	CoreBin       string   // path to the core binary
+	CoreConfig    string   // where the rendered core config is written
+	CoreAPIPort   int      // loopback port for the core's stats/control API
+	// meteringOverride, when set, wins over the environment: the agent probes the
+	// binary and records what it can actually do, so a stock build is never
+	// handed a config it rejects.
+	meteringOverride *bool
+
+	// SingboxV2RayAPI controls whether the sing-box config emits the
+	// experimental.v2ray_api block (per-user stats). When VORTEX_SINGBOX_V2RAY_API
+	// is unset, defaults to false for singbox and true for xray. Set false for
+	// stock sing-box binaries (built without the with_v2ray_api tag).
+	SingboxV2RayAPI bool
+	// ShareAutoLimit, when true, makes the account-sharing guard actually limit
+	// (deprovision) users caught online from more IPs than their device limit.
+	// Default false: detection only emits an alert event.
+	ShareAutoLimit bool
+
+	// GeoIPDB is the path to a MaxMind GeoLite2-Country.mmdb database used to
+	// resolve subscription-fetch IPs to countries for the "Traffic by Country"
+	// analytics. Empty = feature disabled (degrades gracefully).
+	GeoIPDB string
+
+	// Optional payment gateways for plan sales and reseller wallet top-ups.
+	ZarinPalMerchantID   string
+	NowPaymentsAPIKey    string
+	NowPaymentsIPNSecret string
+
+	// Automatic node recovery: restart proxy cores and reset hub connections
+	// without manual intervention or external cron jobs.
+	AutoRecoverCore         bool
+	AutoRecoverCoreAfter    time.Duration
+	AutoRecoverCoreCooldown time.Duration
+	AutoRecoverHub          bool
+	AutoRecoverHubAfter     time.Duration
+	AutoRecoverHubCooldown  time.Duration
+}
+
+// Node holds node-agent configuration. The agent is a gRPC *server* (the panel
+// dials it), so it needs a listen address and mTLS material plus the local core
+// binary/config paths.
+type Node struct {
+	ListenAddr string // where the NodeService gRPC server listens
+	Core       string // legacy single-engine selector: xray | singbox
+	// EnabledCores lists engines this agent runs. When len > 1 a CompositeDriver
+	// is used. Defaults to Core when VORTEX_ENABLED_CORES is unset.
+	EnabledCores []string
+	CoreBin      string // path to the core binary (single-core mode)
+	CoreConfig   string // where the agent writes the rendered core config
+	APIPort      int    // loopback port for the core's stats/control API (single-core)
+
+	// meteringOverride, when set, wins over the environment: the agent probes the
+	// binary and records what it can actually do, so a stock build is never
+	// handed a config it rejects.
+	meteringOverride *bool
+
+	// SingboxV2RayAPI controls whether the sing-box config emits the
+	// experimental.v2ray_api block (per-user stats). When VORTEX_SINGBOX_V2RAY_API
+	// is unset, defaults to false for singbox and true for xray. Set false for
+	// stock sing-box binaries (built without the with_v2ray_api tag).
+	SingboxV2RayAPI bool
+
+	TLSCert string
+	TLSKey  string
+	TLSCA   string
+}
+
+// LoadNode reads node-agent config from the environment, validating required keys.
+func LoadNode() (*Node, error) {
+	core := env("VORTEX_CORE", "xray")
+	enabled := parseCoreList(env("VORTEX_ENABLED_CORES", ""))
+	if len(enabled) == 0 {
+		enabled = []string{core}
+	}
+	c := &Node{
+		ListenAddr:      env("VORTEX_NODE_LISTEN", ":50051"),
+		Core:            core,
+		EnabledCores:    enabled,
+		CoreBin:         env("VORTEX_CORE_BIN", DefaultCoreBin(core)),
+		CoreConfig:      env("VORTEX_CORE_CONFIG", "/etc/vortex/core.json"),
+		APIPort:         envInt("VORTEX_CORE_API_PORT", 10085),
+		SingboxV2RayAPI: singboxV2RayAPIFromEnv(core),
+		TLSCert:         os.Getenv("VORTEX_TLS_CERT"),
+		TLSKey:          os.Getenv("VORTEX_TLS_KEY"),
+		TLSCA:           os.Getenv("VORTEX_TLS_CA"),
+	}
+	var errs []error
+	if c.TLSCert == "" || c.TLSKey == "" || c.TLSCA == "" {
+		errs = append(errs, errors.New("VORTEX_TLS_CERT, VORTEX_TLS_KEY and VORTEX_TLS_CA are required for mTLS"))
+	}
+	return c, errors.Join(errs...)
+}
+
+// LoadPanel reads panel config from the environment, validating required keys.
+func LoadPanel() (*Panel, error) {
+	core := env("VORTEX_CORE", "xray")
+	enabled := parseCoreList(env("VORTEX_ENABLED_CORES", ""))
+	if len(enabled) == 0 {
+		enabled = []string{core}
+	}
+	c := &Panel{
+		HTTPAddr:                env("VORTEX_HTTP_ADDR", ":8080"),
+		GRPCAddr:                env("VORTEX_GRPC_ADDR", ":50051"),
+		DatabaseURL:             os.Getenv("VORTEX_DATABASE_URL"),
+		RedisURL:                env("VORTEX_REDIS_URL", "redis://localhost:6379/0"),
+		JWTSecret:               os.Getenv("VORTEX_JWT_SECRET"),
+		JWTTTL:                  envDur("VORTEX_JWT_TTL", time.Hour),
+		TLSCert:                 os.Getenv("VORTEX_TLS_CERT"),
+		TLSKey:                  os.Getenv("VORTEX_TLS_KEY"),
+		TLSCA:                   os.Getenv("VORTEX_TLS_CA"),
+		WebhookURL:              os.Getenv("VORTEX_WEBHOOK_URL"),
+		WebhookSecret:           os.Getenv("VORTEX_WEBHOOK_SECRET"),
+		TelegramToken:           os.Getenv("VORTEX_TELEGRAM_TOKEN"),
+		TelegramChatID:          os.Getenv("VORTEX_TELEGRAM_CHAT_ID"),
+		CloudflareToken:         os.Getenv("VORTEX_CF_API_TOKEN"),
+		CloudflareZoneID:        os.Getenv("VORTEX_CF_ZONE_ID"),
+		LocalNode:               envBool("VORTEX_LOCAL_NODE", false),
+		LocalNodeName:           env("VORTEX_LOCAL_NODE_NAME", "local"),
+		LocalNodeHost:           env("VORTEX_LOCAL_NODE_HOST", "127.0.0.1"),
+		Core:                    core,
+		EnabledCores:            enabled,
+		CoreBin:                 os.Getenv("VORTEX_CORE_BIN"),
+		CoreConfig:              env("VORTEX_CORE_CONFIG", "/etc/vortex/local-core.json"),
+		CoreAPIPort:             envInt("VORTEX_CORE_API_PORT", 10085),
+		SingboxV2RayAPI:         singboxV2RayAPIFromEnv(core),
+		ShareAutoLimit:          envBool("VORTEX_SHARE_AUTOLIMIT", false),
+		GeoIPDB:                 env("VORTEX_GEOIP_DB", ""),
+		ZarinPalMerchantID:      os.Getenv("VORTEX_ZARINPAL_MERCHANT_ID"),
+		NowPaymentsAPIKey:       os.Getenv("VORTEX_NOWPAYMENTS_API_KEY"),
+		NowPaymentsIPNSecret:    os.Getenv("VORTEX_NOWPAYMENTS_IPN_SECRET"),
+		AutoRecoverCore:         envBool("VORTEX_AUTO_RECOVER_CORE", true),
+		AutoRecoverCoreAfter:    envDur("VORTEX_AUTO_RECOVER_CORE_AFTER", 2*time.Minute),
+		AutoRecoverCoreCooldown: envDur("VORTEX_AUTO_RECOVER_COOLDOWN", 5*time.Minute),
+		AutoRecoverHub:          envBool("VORTEX_AUTO_RECOVER_HUB", true),
+		AutoRecoverHubAfter:     envDur("VORTEX_AUTO_RECOVER_HUB_AFTER", 5*time.Minute),
+		AutoRecoverHubCooldown:  envDur("VORTEX_AUTO_RECOVER_HUB_COOLDOWN", 10*time.Minute),
+	}
+	c.TelegramUserToken = os.Getenv("VORTEX_TELEGRAM_USER_TOKEN")
+	c.PublicURL = os.Getenv("VORTEX_PUBLIC_URL")
+	c.InitToken = os.Getenv("VORTEX_INIT_TOKEN")
+	c.MetricsPublic = envBool("VORTEX_METRICS_PUBLIC", false)
+	c.Personal = envBool("VORTEX_PERSONAL_MODE", false)
+	c.CoreBuild = envBool("VORTEX_CORE_BUILD", false)
+	c.CoreDataDir = env("VORTEX_CORE_DATA_DIR", "data")
+	c.BundledMetered = os.Getenv("VORTEX_BUNDLED_METERED")
+	c.AgentDir = env("VORTEX_AGENT_DIR", "/opt/vortexui/agent")
+	if c.CoreBin == "" {
+		c.CoreBin = DefaultCoreBin(c.Core)
+	}
+	var errs []error
+	if c.DatabaseURL == "" {
+		errs = append(errs, errors.New("VORTEX_DATABASE_URL is required"))
+	}
+	if len(c.JWTSecret) < 32 {
+		errs = append(errs, errors.New("VORTEX_JWT_SECRET must be at least 32 bytes"))
+	}
+	return c, errors.Join(errs...)
+}
+
+func env(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func envDur(k string, def time.Duration) time.Duration {
+	if v := os.Getenv(k); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
+func envInt(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envBool(k string, def bool) bool {
+	if v := os.Getenv(k); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return def
+}
+
+func envBoolUnset(k string) (bool, bool) {
+	v := os.Getenv(k)
+	if v == "" {
+		return false, false
+	}
+	b, err := strconv.ParseBool(v)
+	return b, err == nil
+}
+
+// String renders a redacted summary safe for logs.
+func (p *Panel) String() string {
+	return fmt.Sprintf("Panel{http=%s grpc=%s db=%s redis=%s jwtTTL=%s}",
+		p.HTTPAddr, p.GRPCAddr, redact(p.DatabaseURL), p.RedisURL, p.JWTTTL)
+}
+
+func redact(url string) string {
+	if url == "" {
+		return "<unset>"
+	}
+	return "<set>"
+}
+
+func parseCoreList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]struct{})
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if _, ok := seen[part]; ok {
+			continue
+		}
+		seen[part] = struct{}{}
+		out = append(out, part)
+	}
+	return out
+}
+
+func coreEnvPrefix(core string) string {
+	switch core {
+	case "singbox":
+		return "SINGBOX"
+	case "xray":
+		return "XRAY"
+	default:
+		return strings.ToUpper(core)
+	}
+}
+
+// CoreBinFor returns the binary path for one engine in multi-core mode.
+func (n *Node) CoreBinFor(core string) string {
+	if v := os.Getenv("VORTEX_" + coreEnvPrefix(core) + "_BIN"); v != "" {
+		return v
+	}
+	// A single-engine node keeps its configured path even when EnabledCores was
+	// never populated: otherwise a core install would write to the default
+	// /usr/local/bin instead of where this node actually runs its binary.
+	if len(n.EnabledCores) <= 1 && n.CoreBin != "" && (n.Core == "" || n.Core == core) {
+		return n.CoreBin
+	}
+	return DefaultCoreBin(core)
+}
+
+// CoreConfigFor returns the config file path for one engine.
+func (n *Node) CoreConfigFor(core string) string {
+	if v := os.Getenv("VORTEX_" + coreEnvPrefix(core) + "_CONFIG"); v != "" {
+		return v
+	}
+	if len(n.EnabledCores) == 1 {
+		return n.CoreConfig
+	}
+	switch core {
+	case "xray":
+		return "/etc/vortex/xray.json"
+	case "singbox":
+		return "/etc/vortex/singbox.json"
+	default:
+		return fmt.Sprintf("/etc/vortex/%s.json", core)
+	}
+}
+
+// APIPortFor returns the loopback stats API port for one engine.
+func (n *Node) APIPortFor(core string) int {
+	if v := os.Getenv("VORTEX_" + coreEnvPrefix(core) + "_API_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	if len(n.EnabledCores) == 1 {
+		return n.APIPort
+	}
+	switch core {
+	case "xray":
+		return 10085
+	case "singbox":
+		return 10086
+	default:
+		return 10085
+	}
+}
+
+// SingboxV2RayAPIFor reports whether sing-box should emit v2ray_api for this agent.
+func (n *Node) SingboxV2RayAPIFor() bool {
+	if n.meteringOverride != nil {
+		return *n.meteringOverride
+	}
+	if v, ok := envBoolUnset("VORTEX_SINGBOX_V2RAY_API"); ok {
+		return v
+	}
+	return defaultSingboxV2RayAPI("singbox")
+}
+
+// SetMeteringCapability records what the sing-box binary on disk supports. It
+// overrides VORTEX_SINGBOX_V2RAY_API because the binary, not the operator, gets
+// the final word on whether stats can be emitted.
+func (n *Node) SetMeteringCapability(capable bool) {
+	v := capable
+	n.meteringOverride = &v
+}

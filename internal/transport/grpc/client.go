@@ -1,0 +1,226 @@
+package grpc
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/google/uuid"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
+
+	"github.com/vortexui/vortexui/internal/core"
+	"github.com/vortexui/vortexui/internal/domain"
+	genv1 "github.com/vortexui/vortexui/internal/transport/genv1"
+)
+
+// NodeClient is the panel's handle to one remote node. It hides the generated
+// stub behind domain-typed methods and owns the dialed connection.
+type NodeClient struct {
+	nodeID uuid.UUID
+	conn   *grpc.ClientConn
+	rpc    genv1.NodeServiceClient
+}
+
+// Dial opens an mTLS connection to a node agent with keepalive enabled so
+// intermediate firewalls/NAT don't kill idle long-lived streams.
+func Dial(nodeID uuid.UUID, address string, creds credentials.TransportCredentials) (*NodeClient, error) {
+	conn, err := grpc.NewClient(address,
+		grpc.WithTransportCredentials(creds),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                20 * time.Second, // ping every 20s if idle
+			Timeout:             10 * time.Second, // wait 10s for pong
+			PermitWithoutStream: true,             // keep connection alive even without active streams
+		}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("dial node %s: %w", address, err)
+	}
+	return &NodeClient{nodeID: nodeID, conn: conn, rpc: genv1.NewNodeServiceClient(conn)}, nil
+}
+
+// Close releases the underlying connection.
+func (c *NodeClient) Close() error { return c.conn.Close() }
+
+// Sync pushes the full desired state to the node.
+func (c *NodeClient) Sync(ctx context.Context, cfg *core.GeneratedConfig, coreType domain.CoreType) error {
+	req := &genv1.SyncRequest{
+		Core:           coreTypeToProto(coreType),
+		LogLevel:       cfg.LogLevel,
+		UsersByInbound: make(map[string]*genv1.UserList, len(cfg.UsersByInbound)),
+	}
+	for _, in := range cfg.Inbounds {
+		req.Inbounds = append(req.Inbounds, inboundToSpec(in))
+	}
+	for tag, users := range cfg.UsersByInbound {
+		list := &genv1.UserList{Users: make([]*genv1.UserSpec, 0, len(users))}
+		for _, u := range users {
+			list.Users = append(list.Users, userToSpec(u))
+		}
+		req.UsersByInbound[tag] = list
+	}
+	for _, o := range cfg.Outbounds {
+		req.Outbounds = append(req.Outbounds, outboundToSpec(o))
+	}
+	for _, r := range cfg.Routing {
+		req.Routing = append(req.Routing, routingToSpec(r))
+	}
+	for _, b := range cfg.Balancers {
+		req.Balancers = append(req.Balancers, balancerToSpec(b))
+	}
+	return ackErr(c.rpc.Sync(ctx, req))
+}
+
+// AddUser provisions a user on an inbound at runtime.
+func (c *NodeClient) AddUser(ctx context.Context, inboundTag string, u *domain.User) error {
+	return ackErr(c.rpc.AddUser(ctx, &genv1.AddUserRequest{InboundTag: inboundTag, User: userToSpec(u)}))
+}
+
+// RemoveUser deprovisions a user from an inbound at runtime.
+func (c *NodeClient) RemoveUser(ctx context.Context, inboundTag string, userID uuid.UUID) error {
+	return ackErr(c.rpc.RemoveUser(ctx, &genv1.RemoveUserRequest{InboundTag: inboundTag, UserId: userID.String()}))
+}
+
+// Health fetches a live snapshot for failover decisions.
+func (c *NodeClient) Health(ctx context.Context) (domain.NodeHealth, error) {
+	r, err := c.rpc.Health(ctx, &genv1.HealthRequest{})
+	if err != nil {
+		return domain.NodeHealth{}, err
+	}
+	return domain.NodeHealth{
+		CPUPercent:   r.GetCpuPercent(),
+		MemPercent:   r.GetMemPercent(),
+		DiskPercent:  r.GetDiskPercent(),
+		CoreRunning:  r.GetCoreRunning(),
+		Connections:  int(r.GetConnections()),
+		CoreVersion:  r.GetCoreVersion(),
+		CoreTags:     r.GetCoreTags(),
+		Arch:         r.GetArch(),
+		AgentVersion: r.GetAgentVersion(),
+	}, nil
+}
+
+// OnlineStats fetches the node's current per-user live connection counts.
+func (c *NodeClient) OnlineStats(ctx context.Context) (map[string]int, error) {
+	r, err := c.rpc.OnlineStats(ctx, &genv1.OnlineStatsRequest{})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int, len(r.GetOnline()))
+	for email, n := range r.GetOnline() {
+		out[email] = int(n)
+	}
+	return out, nil
+}
+
+// OnlineIPs fetches the distinct source IPs currently online for one user,
+// mapped to each IP's last-seen unix time.
+func (c *NodeClient) OnlineIPs(ctx context.Context, userID string) (map[string]int64, error) {
+	r, err := c.rpc.OnlineIPs(ctx, &genv1.OnlineIPsRequest{UserId: userID})
+	if err != nil {
+		return nil, err
+	}
+	return r.GetIps(), nil
+}
+
+// UpdateGeo tells the node to download geo routing databases and reload.
+func (c *NodeClient) UpdateGeo(ctx context.Context, geoipURL, geositeURL string) (geoip, geosite int64, err error) {
+	r, err := c.rpc.UpdateGeo(ctx, &genv1.UpdateGeoRequest{GeoipUrl: geoipURL, GeositeUrl: geositeURL})
+	if err != nil {
+		return 0, 0, err
+	}
+	return r.GetGeoipBytes(), r.GetGeositeBytes(), nil
+}
+
+// Logs fetches up to limit recent core log lines from the node.
+func (c *NodeClient) Logs(ctx context.Context, limit int) ([]string, error) {
+	r, err := c.rpc.NodeLogs(ctx, &genv1.NodeLogsRequest{Limit: uint32(limit)})
+	if err != nil {
+		return nil, err
+	}
+	return r.GetLines(), nil
+}
+
+// RestartCore restarts the node's proxy engine.
+func (c *NodeClient) RestartCore(ctx context.Context) error {
+	return ackErr(c.rpc.RestartCore(ctx, &genv1.RestartCoreRequest{}))
+}
+
+// InstallCertificate hands a new TLS identity to the agent, which validates it,
+// persists it and swaps it in for subsequent handshakes.
+func (c *NodeClient) InstallCertificate(ctx context.Context, certPEM, keyPEM []byte, fingerprint string) error {
+	return ackErr(c.rpc.InstallCertificate(ctx, &genv1.InstallCertificateRequest{
+		CertPem:     certPEM,
+		KeyPem:      keyPEM,
+		Fingerprint: fingerprint,
+	}))
+}
+
+// InstallCore asks the node to install a core artifact and restart its engine.
+func (c *NodeClient) InstallCore(ctx context.Context, core, version, url, sha string, allowUnverified bool) error {
+	return ackErr(c.rpc.InstallCore(ctx, &genv1.InstallCoreRequest{
+		Core:            core,
+		Version:         version,
+		Url:             url,
+		Sha256:          sha,
+		AllowUnverified: allowUnverified,
+	}))
+}
+
+// UpgradeAgent asks the node to replace its own binary and restart.
+func (c *NodeClient) UpgradeAgent(ctx context.Context, url, sha string) error {
+	return ackErr(c.rpc.UpgradeAgent(ctx, &genv1.UpgradeAgentRequest{Url: url, Sha256: sha}))
+}
+
+// Probe dials target from the node and reports the outcome. The returned error
+// is a transport failure (the panel could not ask), while the ok/errMsg pair is
+// the node's verdict.
+func (c *NodeClient) Probe(ctx context.Context, target string, timeout time.Duration) (ok bool, latency time.Duration, errMsg string, err error) {
+	resp, err := c.rpc.Probe(ctx, &genv1.ProbeRequest{
+		Target:    target,
+		TimeoutMs: int32(timeout.Milliseconds()),
+	})
+	if err != nil {
+		return false, 0, "", err
+	}
+	return resp.GetOk(), time.Duration(resp.GetLatencyMs()) * time.Millisecond, resp.GetError(), nil
+}
+
+// StopCore stops the node's proxy engine.
+func (c *NodeClient) StopCore(ctx context.Context) error {
+	return ackErr(c.rpc.StopCore(ctx, &genv1.StopCoreRequest{}))
+}
+
+// ConsumeTraffic opens the long-lived traffic stream and hands every delta to
+// ingest until ctx is cancelled or the stream ends. The caller (hub) is expected
+// to call this in its own goroutine and reconnect on error with backoff.
+func (c *NodeClient) ConsumeTraffic(ctx context.Context, ingest func(domain.TrafficDelta)) error {
+	stream, err := c.rpc.StreamTraffic(ctx, &genv1.StreamTrafficRequest{})
+	if err != nil {
+		return fmt.Errorf("open traffic stream: %w", err)
+	}
+	for {
+		d, err := stream.Recv()
+		switch {
+		case err == io.EOF:
+			return nil
+		case err != nil:
+			return fmt.Errorf("recv traffic: %w", err)
+		}
+		ingest(trafficFromProto(d, c.nodeID))
+	}
+}
+
+// ackErr collapses an (Ack, error) reply into a single error: transport errors
+// pass through, and a non-ok Ack becomes an error carrying the node's message.
+func ackErr(a *genv1.Ack, err error) error {
+	if err != nil {
+		return err
+	}
+	if a != nil && !a.GetOk() {
+		return fmt.Errorf("node rejected request: %s", a.GetMessage())
+	}
+	return nil
+}

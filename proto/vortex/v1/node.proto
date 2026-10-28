@@ -1,0 +1,295 @@
+syntax = "proto3";
+
+package vortex.v1;
+
+option go_package = "github.com/vortexui/vortexui/internal/transport/genv1;genv1";
+
+import "google/protobuf/timestamp.proto";
+
+// NodeService is served by the node agent. The panel is the gRPC client and
+// dials each node over mTLS. Mutating RPCs are unary; traffic accounting uses a
+// long-lived server stream so the node *pushes* deltas instead of being polled.
+service NodeService {
+  // Sync replaces the node's entire desired state (inbounds + user bindings).
+  // Used on (re)connect and after bulk changes; idempotent.
+  rpc Sync(SyncRequest) returns (Ack);
+
+  // AddUser provisions one user on one inbound at runtime (no core restart).
+  rpc AddUser(AddUserRequest) returns (Ack);
+
+  // RemoveUser deprovisions one user from one inbound at runtime.
+  rpc RemoveUser(RemoveUserRequest) returns (Ack);
+
+  // StreamTraffic is opened once by the panel and stays open; the node emits a
+  // TrafficDelta whenever it has accounted usage. Deltas are incremental, so the
+  // panel sums them idempotently and restarts never double count.
+  rpc StreamTraffic(StreamTrafficRequest) returns (stream TrafficDelta);
+
+  // Health returns a live resource/liveness snapshot for failover decisions.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // RestartCore restarts the proxy engine process (applies latest config).
+  rpc RestartCore(RestartCoreRequest) returns (Ack);
+
+  // StopCore gracefully shuts the proxy engine down.
+  rpc StopCore(StopCoreRequest) returns (Ack);
+
+  // OnlineStats returns the current live-connection count per user (keyed by the
+  // user's stats email == UUID). Polled on demand by the panel.
+  rpc OnlineStats(OnlineStatsRequest) returns (OnlineStatsResponse);
+
+  // NodeLogs returns the most recent core log lines captured by the agent.
+  rpc NodeLogs(NodeLogsRequest) returns (NodeLogsResponse);
+
+  // OnlineIPs returns the distinct source IPs currently online for one user
+  // (keyed by user stats email == UUID), with each IP's last-seen unix time.
+  // Used to detect account sharing. Empty when the engine cannot report it.
+  rpc OnlineIPs(OnlineIPsRequest) returns (OnlineIPsResponse);
+
+  // UpdateGeo downloads geoip/geosite routing databases into the engine's asset
+  // directory and reloads. Used to refresh country/domain routing data (e.g.
+  // Iran rules) without a full redeploy.
+  rpc UpdateGeo(UpdateGeoRequest) returns (UpdateGeoResponse);
+
+  // InstallCertificate replaces the agent's TLS identity in place. The agent
+  // validates the keypair, writes it to disk atomically (keeping a backup) and
+  // hot-swaps the certificate, so the panel can rotate a node identity without
+  // SSH access or a restart.
+  rpc InstallCertificate(InstallCertificateRequest) returns (Ack);
+
+  // InstallCore replaces the core binary with the given artifact, verifying its
+  // checksum, keeping the old binary as a rollback target and restarting the
+  // engine. Used by the panel's version picker.
+  rpc InstallCore(InstallCoreRequest) returns (Ack);
+
+  // UpgradeAgent replaces this agent's own binary with the one the panel serves
+  // and restarts it. Used by the console's "upgrade agent" action.
+  rpc UpgradeAgent(UpgradeAgentRequest) returns (Ack);
+
+  // Probe dials a TCP endpoint from the node and reports whether it connected.
+  // Used to check a relay path from the side that actually has to traverse it,
+  // instead of guessing from the panel's own vantage point.
+  rpc Probe(ProbeRequest) returns (ProbeResponse);
+}
+
+// ----- shared value types -----
+
+enum CoreType {
+  CORE_TYPE_UNSPECIFIED = 0;
+  CORE_TYPE_XRAY = 1;
+  CORE_TYPE_SINGBOX = 2;
+  CORE_TYPE_MULTI = 3;
+}
+
+// UserSpec is the minimal, engine-neutral identity the core needs to admit a
+// user on an inbound. Secrets are reused across protocols by the panel.
+message UserSpec {
+  string user_id = 1;          // canonical UUID
+  string email = 2;            // core "email"/tag, used as the stats key
+  string vmess_uuid = 3;
+  string vless_uuid = 4;
+  string trojan_password = 5;
+  string ss_password = 6;
+  string ss_method = 7;
+  string flow = 8;             // e.g. xtls-rprx-vision
+}
+
+// InboundSpec is the rendered inbound the node should be listening on. Raw holds
+// engine-native JSON overrides for fields not modeled by the abstraction.
+message InboundSpec {
+  string tag = 1;
+  string protocol = 2;
+  string listen = 3;
+  uint32 port = 4;
+  string network = 5;
+  string security = 6;
+  bytes raw = 7;               // optional native JSON fragment
+  repeated string sni = 8;     // TLS/REALITY server names
+  string path = 9;             // ws path / grpc service name
+  repeated string host = 10;   // ws Host header(s)
+  string flow = 11;            // vless flow (e.g. xtls-rprx-vision)
+  string core = 12;            // xray | singbox; empty = node default
+}
+
+// OutboundSpec is a rendered egress handler (freedom/blackhole/dns or a proxy
+// protocol). The node's builder translates it into engine-native JSON.
+message OutboundSpec {
+  string tag = 1;
+  string protocol = 2;
+  string address = 3;
+  uint32 port = 4;
+  string uuid = 5;
+  string password = 6;
+  string username = 7;
+  string method = 8;
+  string flow = 9;
+  string network = 10;
+  string security = 11;
+  string sni = 12;
+  string path = 13;
+  string host = 14;
+  bytes raw = 15;
+  bool enabled = 16;
+}
+
+// RoutingRuleSpec is one engine-neutral routing decision.
+message RoutingRuleSpec {
+  int32 priority = 1;
+  string name = 2;
+  repeated string inbound_tags = 3;
+  repeated string domains = 4;
+  repeated string ip = 5;
+  string port = 6;
+  repeated string protocols = 7;
+  string network = 8;
+  string outbound_tag = 9;
+  string balancer_tag = 10;
+  bool enabled = 11;
+}
+
+// BalancerSpec distributes traffic across outbounds selected by tag prefix.
+message BalancerSpec {
+  string tag = 1;
+  repeated string selectors = 2;
+  string strategy = 3;
+  bool observe = 4;
+  string probe_url = 5;
+  string probe_interval = 6;
+  bool enabled = 7;
+}
+
+// ----- request/response messages -----
+
+message SyncRequest {
+  CoreType core = 1;
+  string log_level = 2;
+  repeated InboundSpec inbounds = 3;
+  // users_by_inbound maps inbound tag -> users bound to it.
+  map<string, UserList> users_by_inbound = 4;
+  repeated OutboundSpec outbounds = 5;
+  repeated RoutingRuleSpec routing = 6;
+  repeated BalancerSpec balancers = 7;
+}
+
+message UserList {
+  repeated UserSpec users = 1;
+}
+
+message AddUserRequest {
+  string inbound_tag = 1;
+  UserSpec user = 2;
+}
+
+message RemoveUserRequest {
+  string inbound_tag = 1;
+  string user_id = 2;
+}
+
+message StreamTrafficRequest {
+  // min_report_interval_ms lets the panel cap how chatty the stream is; the node
+  // coalesces deltas over at least this window. 0 = node default.
+  uint32 min_report_interval_ms = 1;
+}
+
+// TrafficDelta is bytes consumed *since the previous delta for this user*.
+message TrafficDelta {
+  string user_id = 1;
+  uint64 up = 2;
+  uint64 down = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  double cpu_percent = 1;
+  double mem_percent = 2;
+  double disk_percent = 3;
+  bool core_running = 4;
+  uint32 connections = 5;
+  string core_version = 6;
+  string agent_version = 7;
+  // Build tags reported by the core binary. Used to tell whether this build can
+  // meter traffic per user (sing-box needs with_v2ray_api).
+  string core_tags = 8;
+  // GOARCH of the node, so the panel installs the matching artifact.
+  string arch = 9;
+}
+
+// Ack is the standard mutating-RPC reply.
+message Ack {
+  bool ok = 1;
+  string message = 2;          // human-readable detail on failure
+}
+
+message OnlineStatsRequest {}
+
+message RestartCoreRequest {}
+message StopCoreRequest {}
+
+// OnlineStatsResponse maps a user's stats email (UUID) to its current live
+// connection count. Absent users have zero connections.
+message OnlineStatsResponse {
+  map<string, uint32> online = 1;
+}
+
+message OnlineIPsRequest {
+  string user_id = 1; // user stats email == UUID
+}
+
+message UpdateGeoRequest {
+  string geoip_url = 1;   // empty = skip geoip.dat
+  string geosite_url = 2; // empty = skip geosite.dat
+}
+
+message UpdateGeoResponse {
+  int64 geoip_bytes = 1;
+  int64 geosite_bytes = 2;
+}
+
+// OnlineIPsResponse maps each currently-online source IP to its last-seen unix
+// time (seconds) for the requested user.
+message OnlineIPsResponse {
+  map<string, int64> ips = 1;
+}
+
+message NodeLogsRequest {
+  uint32 limit = 1; // 0 = all retained lines
+}
+
+message NodeLogsResponse {
+  repeated string lines = 1; // oldest first
+}
+
+message InstallCertificateRequest {
+  bytes cert_pem = 1;      // PEM-encoded leaf certificate
+  bytes key_pem = 2;       // PEM-encoded private key
+  string fingerprint = 3;  // expected SHA-256 (uppercase hex); agent rejects a mismatch
+}
+
+message InstallCoreRequest {
+  string core = 1;      // xray | singbox
+  string version = 2;   // human-readable, for logging
+  string url = 3;       // http(s) artifact served by the panel
+  string sha256 = 4;    // required unless allow_unverified is set
+  // allow_unverified permits a vendor artifact whose checksum GitHub does not
+  // publish. The panel sets it only for upstream rows; built artifacts always
+  // carry a checksum.
+  bool allow_unverified = 5;
+}
+
+message UpgradeAgentRequest {
+  string url = 1;     // panel-served agent binary
+  string sha256 = 2;  // optional; enforced when set
+}
+
+message ProbeRequest {
+  string target = 1;       // host:port to dial
+  int32 timeout_ms = 2;    // dial timeout; agent caps it
+}
+
+message ProbeResponse {
+  bool ok = 1;
+  int64 latency_ms = 2;
+  string error = 3;        // empty when ok
+}

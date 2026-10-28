@@ -1,0 +1,30 @@
+# VortexUI — Caddy reverse proxy + SPA server
+# Serves on :80 by default. Set SITE_ADDRESS=domain.com for auto-HTTPS.
+
+{$SITE_ADDRESS::80} {
+	encode gzip
+
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle /sub/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle /health {
+		reverse_proxy 127.0.0.1:8080
+	}
+	# Node-facing paths: the one-command installer and the artifacts it fetches
+	# (agent binary, core builds). Without these the SPA answers instead.
+	handle /join/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle /downloads/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	handle {
+		root * /usr/share/caddy
+		try_files {path} /index.html
+		file_server
+	}
+}

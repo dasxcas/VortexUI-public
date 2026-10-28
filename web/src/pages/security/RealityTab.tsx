@@ -1,0 +1,263 @@
+import { useMemo, useState, useEffect } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { Play, Sparkles } from "lucide-react";
+import { api } from "@/api/client";
+import { useInboundsFleet, useUpdateInbound, inboundToUpdateInput, type InboundFleetRow } from "@/api/hooks";
+import { Badge, Button, Input, Select } from "@/components/ui";
+import { GlassCard } from "@/components/vortexui";
+import { useToast } from "@/components/toast";
+import { useI18n } from "@/i18n/i18n";
+import { cn } from "@/lib/utils";
+
+interface ScanResult {
+  sni: string;
+  resolved_ip?: string;
+  tls_version?: string;
+  alpn?: string;
+  latency_ms: number;
+  score: number;
+  valid: boolean;
+  error?: string;
+}
+
+interface Node {
+  id: string;
+  name: string;
+}
+
+const DEFAULT_SNIS = [
+  "www.microsoft.com",
+  "dl.google.com",
+  "www.apple.com",
+  "aws.amazon.com",
+  "www.cloudflare.com",
+  "support.lenovo.com",
+  "www.github.com",
+  "www.mozilla.org",
+  "www.spotify.com",
+  "www.discord.com",
+];
+
+function scoreBarClass(score: number): string {
+  if (score >= 80) return "bg-success";
+  if (score >= 50) return "bg-warning";
+  return "bg-danger";
+}
+
+function tlsBadge(version?: string, alpn?: string) {
+  if (!version) return "—";
+  const alpnLabel = alpn?.toLowerCase().includes("h2") ? "H2" : alpn || "";
+  return alpnLabel ? `${version} · ${alpnLabel}` : version;
+}
+
+export function RealityTab() {
+  const { t } = useI18n();
+  const toast = useToast();
+  const [nodeId, setNodeId] = useState("");
+  const [snis, setSnis] = useState(DEFAULT_SNIS.join("\n"));
+  const [port, setPort] = useState("443");
+  const [results, setResults] = useState<ScanResult[]>([]);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  const { data: nodesData } = useQuery({
+    queryKey: ["nodes"],
+    queryFn: () => api<{ nodes: Node[] }>("/api/nodes"),
+  });
+  const fleet = useInboundsFleet();
+  const realityInbounds = useMemo(
+    () => (fleet.data?.inbounds ?? []).filter((ib) => ib.node_id === nodeId && ib.security === "reality"),
+    [fleet.data, nodeId],
+  );
+
+  const scanMut = useMutation({
+    mutationFn: () =>
+      api<{ results: ScanResult[] }>("/api/reality/scan", {
+        method: "POST",
+        body: {
+          node_id: nodeId,
+          snis: snis.split("\n").map((s) => s.trim()).filter(Boolean),
+          port: Number(port),
+        },
+      }),
+    onSuccess: (data) => {
+      setResults(data.results);
+      toast.success(`${t("security.reality.scanDone")}: ${data.results.length}`);
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  function copySni(sni: string) {
+    navigator.clipboard.writeText(sni);
+    toast.success(t("security.reality.sniCopied"));
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl border border-primary/25 bg-primary/5 px-4 py-3 flex flex-col sm:flex-row sm:items-center gap-3">
+        <div className="flex items-start gap-3 flex-1 min-w-0">
+          <div className="h-8 w-8 rounded-full bg-primary/15 flex items-center justify-center text-primary flex-shrink-0">
+            <Sparkles size={16} />
+          </div>
+          <p className="text-xs text-fg-muted leading-relaxed">{t("security.reality.banner")}</p>
+        </div>
+        <Button
+          size="sm"
+          className="flex-shrink-0"
+          onClick={() => scanMut.mutate()}
+          disabled={!nodeId || scanMut.isPending}
+        >
+          <Play size={14} />
+          {scanMut.isPending ? t("security.reality.scanning") : t("security.reality.runScan")}
+        </Button>
+      </div>
+
+      <GlassCard glow className="!p-4 space-y-3">
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+          <Select value={nodeId} onChange={(e) => setNodeId(e.target.value)}>
+            <option value="">{t("security.reality.selectNode")}</option>
+            {nodesData?.nodes?.map((n) => (
+              <option key={n.id} value={n.id}>{n.name}</option>
+            ))}
+          </Select>
+          <Input placeholder={t("cleanip.port")} value={port} onChange={(e) => setPort(e.target.value)} inputMode="numeric" />
+          <Button variant="outline" size="sm" onClick={() => setShowAdvanced((v) => !v)}>
+            {showAdvanced ? t("security.reality.hideSnis") : t("security.reality.editSnis")}
+          </Button>
+        </div>
+        {showAdvanced && (
+          <textarea
+            placeholder="SNI (one per line)…"
+            value={snis}
+            onChange={(e) => setSnis(e.target.value)}
+            className="field min-h-[120px] resize-y font-mono text-xs"
+            dir="ltr"
+          />
+        )}
+      </GlassCard>
+
+      {results.length > 0 && (
+        <GlassCard glow className="!p-0 overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-border/40 text-[11px] uppercase tracking-wide text-fg-subtle bg-surface-2/30">
+                  <th className="py-3 px-4 text-left">{t("security.reality.colDomain")}</th>
+                  <th className="py-3 px-4 text-left">{t("security.reality.colIP")}</th>
+                  <th className="py-3 px-4 text-center">{t("security.reality.colTLS")}</th>
+                  <th className="py-3 px-4 text-center">{t("cleanip.latency")}</th>
+                  <th className="py-3 px-4 text-left">{t("security.reality.colScore")}</th>
+                  <th className="py-3 px-4 text-right">{t("common.actions")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {results.map((r) => (
+                  <tr key={r.sni} className="border-b border-border/20 hover:bg-surface-2/40">
+                    <td className="py-3 px-4 font-mono text-xs text-fg">{r.sni}</td>
+                    <td className="py-3 px-4 font-mono text-xs text-fg-muted" dir="ltr">{r.resolved_ip || "—"}</td>
+                    <td className="py-3 px-4 text-center">
+                      {r.valid ? (
+                        <Badge color="active">{tlsBadge(r.tls_version, r.alpn)}</Badge>
+                      ) : (
+                        <Badge color="down">—</Badge>
+                      )}
+                    </td>
+                    <td className="py-3 px-4 text-center text-xs tabular-nums text-fg-muted">{r.latency_ms} ms</td>
+                    <td className="py-3 px-4">
+                      <div className="flex items-center gap-2 min-w-[120px]">
+                        <div className="flex-1 h-1.5 rounded-full bg-surface-3 overflow-hidden">
+                          <div className={cn("h-full rounded-full", scoreBarClass(r.score))} style={{ width: `${r.score}%` }} />
+                        </div>
+                        <span className="text-xs font-bold tabular-nums w-8 text-end">{r.score}</span>
+                      </div>
+                    </td>
+                    <td className="py-3 px-4 text-right">
+                      <ApplyToInboundCell sni={r.sni} inbounds={realityInbounds} onCopyFallback={copySni} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </GlassCard>
+      )}
+
+      {results.length === 0 && !scanMut.isPending && (
+        <p className="text-sm text-fg-muted text-center py-8">{t("security.reality.empty")}</p>
+      )}
+    </div>
+  );
+}
+
+// ApplyToInboundCell lets an admin push a scanned SNI straight into a REALITY
+// inbound's server-name list. When the selected node has no REALITY inbound
+// yet, it falls back to copy-to-clipboard so the value isn't lost.
+function ApplyToInboundCell({
+  sni,
+  inbounds,
+  onCopyFallback,
+}: {
+  sni: string;
+  inbounds: InboundFleetRow[];
+  onCopyFallback: (sni: string) => void;
+}) {
+  const { t } = useI18n();
+  const toast = useToast();
+  const update = useUpdateInbound();
+  const [targetId, setTargetId] = useState("");
+
+  useEffect(() => {
+    if (inbounds.length === 0) {
+      setTargetId("");
+      return;
+    }
+    setTargetId((cur) => (inbounds.some((ib) => ib.id === cur) ? cur : inbounds[0].id));
+  }, [inbounds]);
+
+  if (inbounds.length === 0) {
+    return (
+      <Button size="sm" variant="outline" onClick={() => onCopyFallback(sni)}>
+        {t("security.reality.copySni")}
+      </Button>
+    );
+  }
+
+  const target = inbounds.find((ib) => ib.id === targetId) ?? inbounds[0];
+  const isPrimary = target?.sni?.[0] === sni;
+
+  function apply() {
+    if (!target) return;
+    const sniList = [sni, ...(target.sni ?? []).filter((x) => x !== sni)];
+    update.mutate(
+      {
+        id: target.id,
+        input: inboundToUpdateInput(target, { sni: sniList }),
+      },
+      {
+        onSuccess: () => toast.success(t("security.reality.applied").replace("{tag}", target.tag)),
+        onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "failed"),
+      },
+    );
+  }
+
+  return (
+    <div className="flex items-center justify-end gap-1.5">
+      {inbounds.length > 1 && (
+        <select
+          value={targetId}
+          onChange={(e) => setTargetId(e.target.value)}
+          className="field !h-8 !py-0 text-xs w-28"
+          dir="ltr"
+        >
+          {inbounds.map((ib) => (
+            <option key={ib.id} value={ib.id}>
+              {ib.tag}
+            </option>
+          ))}
+        </select>
+      )}
+      <Button size="sm" variant={isPrimary ? "ghost" : "outline"} onClick={apply} disabled={update.isPending || isPrimary}>
+        {isPrimary ? t("common.applied") : t("security.reality.applyInbound")}
+      </Button>
+    </div>
+  );
+}

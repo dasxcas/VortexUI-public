@@ -1,0 +1,761 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import {
+  Copy,
+  Cpu,
+  HardDrive,
+  MemoryStick,
+  Plus,
+  Server,
+  Settings,
+  Signal,
+  Users,
+} from "lucide-react";
+import {
+  useCreateJoinLink,
+  useDeleteNode,
+  useNodeDebugBundle,
+  useNodes,
+  useRevokeJoinLinks,
+  useRotateNodeCert,
+  useUpgradeNodeAgent,
+} from "@/api/hooks";
+import { useRestartCore, useStopCore, useUpdateGeo } from "@/api/policy-hooks";
+import type { EnrollmentBundle, Node } from "@/api/types";
+import { Badge, Button } from "@/components/ui";
+import { CreateNodeModal, diagColor, diagLabel, phaseLabel } from "@/components/CreateNodeModal";
+import { CoreVersionsModal } from "@/components/CoreVersionsModal";
+import { EditNodeModal } from "@/components/EditNodeModal";
+import { NodeInboundsModal } from "@/components/NodeInboundsModal";
+import { NodeLogsModal } from "@/components/NodeLogsModal";
+import { Modal } from "@/components/Modal";
+import { CoreBadge, GlassCard, StatusBadge } from "@/components/vortexui";
+import { useConfirm } from "@/components/confirm";
+import { useToast } from "@/components/toast";
+import { useI18n } from "@/i18n/i18n";
+import { useTitle } from "@/lib/useTitle";
+import { useAuth } from "@/auth/auth";
+import { EmptyState } from "@/components/EmptyState";
+import { cn } from "@/lib/utils";
+
+type FleetFilter = "" | "online" | "warning" | "offline";
+
+const FLEET_FILTERS: { value: FleetFilter; labelKey: "users.filterAll" | "nodes.filterOnline" | "nodes.filterWarning" | "nodes.filterOffline" }[] = [
+  { value: "", labelKey: "users.filterAll" },
+  { value: "online", labelKey: "nodes.filterOnline" },
+  { value: "warning", labelKey: "nodes.filterWarning" },
+  { value: "offline", labelKey: "nodes.filterOffline" },
+];
+
+function timeAgoShort(iso: string | null): string {
+  if (!iso) return "—";
+  const diff = Date.now() - new Date(iso).getTime();
+  const sec = Math.floor(diff / 1000);
+  if (sec < 0) return "now";
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m`;
+  const hrs = Math.floor(min / 60);
+  if (hrs < 24) return `${hrs}h`;
+  return `${Math.floor(hrs / 24)}d`;
+}
+
+// meteringOf says whether this node's core can count traffic per user. Xray
+// always can; sing-box only when built with with_v2ray_api. An agent too old to
+// report tags is "unknown" — never presented as unmetered.
+function meteringOf(n: Node): "metered" | "unmetered" | "unknown" {
+  if (n.core !== "singbox") return "metered";
+  const tags = n.health?.core_tags;
+  if (!tags) return "unknown";
+  return tags.includes("with_v2ray_api") ? "metered" : "unmetered";
+}
+
+function isNodeOnline(n: Node): boolean {
+  const lastSeenFresh =
+    n.last_seen != null && Date.now() - new Date(n.last_seen).getTime() < 90_000;
+  return lastSeenFresh && n.health.core_running;
+}
+
+function nodeDisplayStatus(n: Node): "active" | "warning" | "inactive" {
+  if (!isNodeOnline(n)) return "inactive";
+  const load = Math.max(n.health.cpu_percent ?? 0, n.health.mem_percent ?? 0);
+  if (load > 75) return "warning";
+  return "active";
+}
+
+function statusLabel(status: "active" | "warning" | "inactive", online: boolean): string {
+  if (!online) return "OFFLINE";
+  if (status === "warning") return "WARNING";
+  return "ONLINE";
+}
+
+function matchesFleetFilter(n: Node, filter: FleetFilter): boolean {
+  const st = nodeDisplayStatus(n);
+  switch (filter) {
+    case "online":
+      return st === "active";
+    case "warning":
+      return st === "warning";
+    case "offline":
+      return st === "inactive";
+    default:
+      return true;
+  }
+}
+
+/** Renders a 2-letter ISO country code as a flag emoji via regional indicator
+ * symbols; falls back to a globe icon when no code is set. */
+function flagEmoji(code?: string): string {
+  if (!code || code.length !== 2) return "🌐";
+  const cc = code.toUpperCase();
+  const points = [...cc].map((c) => 127397 + c.charCodeAt(0));
+  return String.fromCodePoint(...points);
+}
+
+function metricTone(v: number): { bar: string; text: string } {
+  if (v > 85) return { bar: "bg-danger", text: "text-danger" };
+  if (v > 65) return { bar: "bg-warning", text: "text-warning" };
+  return { bar: "bg-success", text: "text-success" };
+}
+
+function MetricBar({ icon, label, value }: { icon: React.ReactNode; label: string; value: number }) {
+  const v = Math.min(100, Math.max(0, value || 0));
+  const tone = metricTone(v);
+  return (
+    <div className="flex items-center gap-2">
+      <span className="flex items-center gap-1 text-[10px] text-fg-subtle w-9 flex-shrink-0">
+        {icon}
+        {label}
+      </span>
+      <div className="flex-1 h-1.5 rounded-full bg-surface-3 overflow-hidden">
+        <div
+          className={cn("h-full rounded-full transition-all duration-500", tone.bar)}
+          style={{ width: `${v}%` }}
+        />
+      </div>
+      <span className={cn("text-[10px] font-bold tabular-nums w-8 text-end flex-shrink-0", tone.text)}>
+        {v.toFixed(0)}%
+      </span>
+    </div>
+  );
+}
+
+export function Nodes() {
+  useTitle("Nodes");
+  const { can } = useAuth();
+  const canManage = can("node:write");
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const [fleetFilter, setFleetFilter] = useState<FleetFilter>("");
+  const [menuNodeId, setMenuNodeId] = useState<string | null>(null);
+  const [coreNode, setCoreNode] = useState<Node | null>(null);
+  const [joinFor, setJoinFor] = useState<Node | null>(null);
+  const [joinCmd, setJoinCmd] = useState("");
+  const [joinErr, setJoinErr] = useState("");
+  const [joinExpires, setJoinExpires] = useState("");
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (searchParams.get("tab") === "inbounds") {
+      navigate("/inbounds", { replace: true });
+    }
+  }, [searchParams, navigate]);
+
+  const { data, isLoading } = useNodes();
+  const del = useDeleteNode();
+  const restart = useRestartCore();
+  const stop = useStopCore();
+  const updateGeo = useUpdateGeo();
+  const debug = useNodeDebugBundle();
+  const rotateCert = useRotateNodeCert();
+  const joinLink = useCreateJoinLink();
+  const upgradeAgent = useUpgradeNodeAgent();
+  const revokeJoins = useRevokeJoinLinks();
+  const confirm = useConfirm();
+  const toast = useToast();
+  const { t } = useI18n();
+
+  const [createOpen, setCreateOpen] = useState(false);
+  const [editing, setEditing] = useState<Node | null>(null);
+  const [managing, setManaging] = useState<Node | null>(null);
+  const [logging, setLogging] = useState<Node | null>(null);
+  const [rotatedFor, setRotatedFor] = useState<Node | null>(null);
+  const [rotatedBundle, setRotatedBundle] = useState<EnrollmentBundle | null>(null);
+
+  const nodes = data?.nodes ?? [];
+
+  const filteredNodes = useMemo(
+    () => nodes.filter((n) => matchesFleetFilter(n, fleetFilter)),
+    [nodes, fleetFilter],
+  );
+
+  const summary = useMemo(() => {
+    let active = 0;
+    let warning = 0;
+    let offline = 0;
+    let users = 0;
+    for (const n of nodes) {
+      const st = nodeDisplayStatus(n);
+      if (st === "active") active++;
+      else if (st === "warning") warning++;
+      else offline++;
+      users += n.users_count ?? 0;
+    }
+    return { active, warning, offline, users };
+  }, [nodes]);
+
+  useEffect(() => {
+    function onDocClick(e: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(e.target as globalThis.Node)) {
+        setMenuNodeId(null);
+      }
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, []);
+
+  async function remove(n: Node) {
+    setMenuNodeId(null);
+    if (
+      await confirm({
+        title: `Delete node ${n.name}?`,
+        message: "Its inbounds are removed and the agent is deregistered.",
+        confirmLabel: "Delete",
+        destructive: true,
+      })
+    ) {
+      del
+        .mutateAsync(n.id)
+        .then(() => toast.success(`Deleted ${n.name}`))
+        .catch(() => toast.error("Delete failed"));
+    }
+  }
+
+  // Rotation is one action on purpose: revoking alone would leave the node with
+  // no pinned certificate, which falls back to CA-only verification.
+  async function doRotate(n: Node) {
+    setMenuNodeId(null);
+    const ok = await confirm({
+      title: `Rotate the certificate for ${n.name}?`,
+      message:
+        "A new identity is issued and pushed to the node over its existing connection, so it takes effect without a restart. If the push fails, you get the bundle to install by hand.",
+      confirmLabel: "Rotate",
+      destructive: true,
+    });
+    if (!ok) return;
+    try {
+      const res = await rotateCert.mutateAsync(n.id);
+      setRotatedFor(n);
+      setRotatedBundle(res);
+    } catch {
+      toast.error("Rotation failed");
+    }
+  }
+
+  async function doStop(n: Node) {
+    setMenuNodeId(null);
+    if (
+      await confirm({
+        title: `Stop core on ${n.name}?`,
+        message: "The proxy engine will shut down. Users on this node will disconnect.",
+        confirmLabel: "Stop",
+        destructive: true,
+      })
+    ) {
+      stop
+        .mutateAsync(n.id)
+        .then(() => toast.success("Core stopped"))
+        .catch(() => toast.error("Stop failed"));
+    }
+  }
+
+  async function doUpdateGeo(n: Node) {
+    setMenuNodeId(null);
+    if (
+      await confirm({
+        title: `Update geo data on ${n.name}?`,
+        message: "Downloads the latest Iran geoip/geosite databases and restarts the core (brief reconnect).",
+        confirmLabel: "Update",
+      })
+    ) {
+      toast.info("Updating geo data…");
+      updateGeo
+        .mutateAsync(n.id)
+        .then((r) =>
+          toast.success(`Geo updated (${Math.round((r.geoip_bytes + r.geosite_bytes) / 1024)} KB)`),
+        )
+        .catch(() => toast.error("Geo update failed"));
+    }
+  }
+
+  async function copyDebug(n: Node) {
+    setMenuNodeId(null);
+    try {
+      const res = await debug.mutateAsync(n.id);
+      await navigator.clipboard.writeText(res.debug_text);
+      toast.success("Debug bundle copied");
+    } catch {
+      toast.error("Could not copy debug bundle");
+    }
+  }
+
+  return (
+    <div className="space-y-5 animate-page-enter">
+      <CreateNodeModal open={createOpen} onClose={() => setCreateOpen(false)} />
+      <CoreVersionsModal node={coreNode} onClose={() => setCoreNode(null)} />
+
+      <Modal
+        open={!!joinFor}
+        onClose={() => setJoinFor(null)}
+        title={t("x.installTitle").replace("{name}", joinFor?.name ?? "node")}
+        size="lg"
+      >
+        <div className="space-y-3">
+          <p className="text-sm text-fg-muted">
+            Run this on the new machine as root. It installs the agent, its certificate
+            bundle and a systemd unit, then the node appears here as connected.
+          </p>
+          {joinErr && <p className="text-sm text-danger">{joinErr}</p>}
+          {!joinCmd && !joinErr && <p className="text-sm text-fg-subtle">Generating a single-use command…</p>}
+          {joinCmd && (
+            <>
+              <pre className="overflow-x-auto rounded-lg border border-border/60 bg-secondary/40 p-3 text-xs">
+                {joinCmd}
+              </pre>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-fg-subtle">
+                  single use{joinExpires ? `, expires ${joinExpires}` : ""} · needs ports 50051 open from the panel
+                </span>
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(joinCmd);
+                    toast.success("Command copied");
+                  }}
+                >
+                  <Copy size={14} /> Copy
+                </Button>
+              </div>
+              <p className="text-xs text-fg-subtle">
+                The install link is the credential — treat it like a password until it is used.
+              </p>
+              <div className="flex justify-end">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-danger"
+                  onClick={async () => {
+                    if (!joinFor) return;
+                    const ok = await confirm({
+                      title: "Revoke outstanding install links?",
+                      message: "Any command minted for this node stops working immediately.",
+                      confirmLabel: "Revoke",
+                      destructive: true,
+                    });
+                    if (!ok) return;
+                    try {
+                      const r = await revokeJoins.mutateAsync(joinFor.id);
+                      toast.success(`${r.revoked} link(s) revoked`);
+                      setJoinCmd("");
+                    } catch (e) {
+                      toast.error(e instanceof Error ? e.message : String(e));
+                    }
+                  }}
+                >
+                  Revoke link
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
+      </Modal>
+      <EditNodeModal node={editing} onClose={() => setEditing(null)} />
+      <NodeInboundsModal node={managing} onClose={() => setManaging(null)} />
+      <NodeLogsModal node={logging} onClose={() => setLogging(null)} />
+
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-bold text-fg tracking-tight">{t("nodes.managementTitle")}</h1>
+            <span className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 text-[10px] font-bold text-primary border border-primary/20">
+              {nodes.length} {t("nodes.registeredNodes")}
+            </span>
+          </div>
+          <p className="text-sm text-fg-muted mt-1">
+            Fleet monitoring & management
+          </p>
+        </div>
+        {canManage && (
+          <Button onClick={() => setCreateOpen(true)}>
+            <Plus size={15} /> {t("nodes.new")}
+          </Button>
+        )}
+      </div>
+
+      {/* Fleet summary — active / warning / offline / total users at a glance */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <GlassCard className="!p-3.5 text-center" glow>
+          <p className="text-2xl font-black tabular-nums leading-none text-success">{summary.active}</p>
+          <p className="text-[9px] font-bold uppercase tracking-widest text-fg-subtle mt-1.5">{t("nodes.filterOnline")}</p>
+          <div className="mt-2 h-1 rounded-full bg-surface-3 overflow-hidden">
+            <div className="h-full rounded-full bg-success transition-all" style={{ width: `${nodes.length > 0 ? (summary.active / nodes.length) * 100 : 0}%` }} />
+          </div>
+        </GlassCard>
+        <GlassCard className="!p-3.5 text-center" glow>
+          <p className="text-2xl font-black tabular-nums leading-none text-warning">{summary.warning}</p>
+          <p className="text-[9px] font-bold uppercase tracking-widest text-fg-subtle mt-1.5">{t("nodes.filterWarning")}</p>
+          <div className="mt-2 h-1 rounded-full bg-surface-3 overflow-hidden">
+            <div className="h-full rounded-full bg-warning transition-all" style={{ width: `${nodes.length > 0 ? (summary.warning / nodes.length) * 100 : 0}%` }} />
+          </div>
+        </GlassCard>
+        <GlassCard className="!p-3.5 text-center" glow>
+          <p className="text-2xl font-black tabular-nums leading-none text-danger">{summary.offline}</p>
+          <p className="text-[9px] font-bold uppercase tracking-widest text-fg-subtle mt-1.5">{t("nodes.filterOffline")}</p>
+          <div className="mt-2 h-1 rounded-full bg-surface-3 overflow-hidden">
+            <div className="h-full rounded-full bg-danger transition-all" style={{ width: `${nodes.length > 0 ? (summary.offline / nodes.length) * 100 : 0}%` }} />
+          </div>
+        </GlassCard>
+        <GlassCard className="!p-3.5 text-center" glow>
+          <p className="text-2xl font-black tabular-nums leading-none text-primary">{summary.users}</p>
+          <p className="text-[9px] font-bold uppercase tracking-widest text-fg-subtle mt-1.5">{t("nodes.users")}</p>
+          <div className="mt-2 h-1 rounded-full bg-surface-3 overflow-hidden">
+            <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${nodes.length > 0 ? (summary.users / Math.max(...nodes.map(n => n.users_count ?? 0), 1)) * 100 : 0}%` }} />
+          </div>
+        </GlassCard>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1">
+        {FLEET_FILTERS.map((f) => (
+          <button
+            key={f.value || "all"}
+            type="button"
+            onClick={() => setFleetFilter(f.value)}
+            className={cn(
+              "px-3.5 py-1.5 rounded-lg text-xs font-medium transition-all",
+              fleetFilter === f.value
+                ? "bg-primary text-primary-fg shadow-sm"
+                : "text-fg-muted hover:text-fg hover:bg-surface/60",
+            )}
+          >
+            {t(f.labelKey)}
+          </button>
+        ))}
+      </div>
+
+      {isLoading && (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <div key={i} className="rounded-2xl bg-bg-elevated border border-border p-4 space-y-3 animate-shimmer bg-gradient-to-r from-surface-2/40 via-surface-2/80 to-surface-2/40 bg-[length:200%_100%]">
+              <div className="h-4 w-24 bg-surface-2/60 rounded" />
+              <div className="h-8 w-32 bg-surface-2/40 rounded" />
+              <div className="h-3 w-full bg-surface-2/30 rounded" />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!isLoading && filteredNodes.length === 0 && (
+        <GlassCard hover={false}>
+          <EmptyState
+            icon={Server}
+            title={nodes.length === 0 ? t("nodes.none") : t("users.none")}
+            description={nodes.length === 0
+              ? (canManage ? "Add your first node to start routing traffic." : "No nodes assigned yet.")
+              : undefined}
+            action={nodes.length === 0 && canManage ? { label: "Add Node", onClick: () => setCreateOpen(true) } : undefined}
+          />
+        </GlassCard>
+      )}
+
+      {!isLoading && filteredNodes.length > 0 && (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          {filteredNodes.map((n) => {
+            const online = isNodeOnline(n);
+            const status = nodeDisplayStatus(n);
+            const location = n.location || n.region || n.name;
+            const isMenuOpen = menuNodeId === n.id;
+            return (
+              <GlassCard key={n.id} hover className="!p-4 flex flex-col gap-3.5">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span className="text-xl leading-none flex-shrink-0">{flagEmoji(n.country_code)}</span>
+                    <div className="min-w-0">
+                      <p className="font-semibold text-fg text-sm truncate">{n.name}</p>
+                      <p className="text-[10px] text-fg-subtle truncate">{location}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 flex-shrink-0">
+                    <StatusBadge status={status} label={statusLabel(status, online)} pulse={online && status === "active"} />
+                    <div className="relative" ref={isMenuOpen ? menuRef : undefined}>
+                      <button
+                        type="button"
+                        onClick={() => setMenuNodeId(isMenuOpen ? null : n.id)}
+                        className="p-1.5 rounded-lg text-fg-muted hover:text-fg hover:bg-surface-2/80 transition"
+                        aria-label={t("common.actions")}
+                      >
+                        <Settings size={15} />
+                      </button>
+                      {isMenuOpen && (
+                        <div className="absolute end-0 top-full mt-1 z-20 min-w-[170px] rounded-lg border border-border/60 bg-surface shadow-lg py-1 text-xs">
+                          <MenuAction onClick={() => { setManaging(n); setMenuNodeId(null); }}>
+                            {t("nodes.inbounds")}
+                          </MenuAction>
+                          <MenuAction onClick={() => { setLogging(n); setMenuNodeId(null); }}>
+                            Logs
+                          </MenuAction>
+                          {!online && (
+                            <MenuAction onClick={() => copyDebug(n)}>
+                              <Copy size={13} className="inline me-1" />
+                              Debug
+                            </MenuAction>
+                          )}
+                          {canManage && (
+                            <>
+                              {online ? (
+                                <MenuAction className="text-warning" onClick={() => doStop(n)}>
+                                  Stop
+                                </MenuAction>
+                              ) : (
+                                <MenuAction
+                                  className="text-success"
+                                  onClick={() => {
+                                    setMenuNodeId(null);
+                                    restart
+                                      .mutateAsync(n.id)
+                                      .then(() => toast.success("Core started"))
+                                      .catch(() => toast.error("Start failed"));
+                                  }}
+                                >
+                                  Start
+                                </MenuAction>
+                              )}
+                              <MenuAction
+                                onClick={() => {
+                                  setMenuNodeId(null);
+                                  restart
+                                    .mutateAsync(n.id)
+                                    .then(() => toast.success("Core restarted"))
+                                    .catch(() => toast.error("Restart failed"));
+                                }}
+                              >
+                                Restart
+                              </MenuAction>
+                              <MenuAction onClick={() => doUpdateGeo(n)}>Update Geo</MenuAction>
+                              <MenuAction onClick={() => navigate(`/routing/node-rules?node=${n.id}`)}>{t("nav.routing")}</MenuAction>
+                              <MenuAction
+                                onClick={async () => {
+                                  setMenuNodeId(null);
+                                  const ok = await confirm({
+                                    title: `Upgrade the agent on ${n.name}?`,
+                                    message:
+                                      "It downloads the agent this panel ships, checks it runs, then restarts itself. The node reconnects in a few seconds; users are not affected.",
+                                    confirmLabel: "Upgrade",
+                                  });
+                                  if (!ok) return;
+                                  upgradeAgent
+                                    .mutateAsync(n.id)
+                                    .then(() => toast.success("Agent upgraded; reconnecting"))
+                                    .catch((e) => toast.error(e instanceof Error ? e.message : String(e)));
+                                }}
+                              >
+                                {t("x.upgradeAgent")}
+                              </MenuAction>
+                              <MenuAction
+                                onClick={() => {
+                                  setMenuNodeId(null);
+                                  setJoinFor(n);
+                                  setJoinCmd("");
+                                  setJoinErr("");
+                                  joinLink
+                                    .mutateAsync(n.id)
+                                    .then((r) => {
+                                      setJoinCmd(r.command);
+                                      setJoinExpires(new Date(r.expires_at).toLocaleTimeString());
+                                    })
+                                    .catch((e) => setJoinErr(e instanceof Error ? e.message : String(e)));
+                                }}
+                              >
+                                {t("x.installCommand")}
+                              </MenuAction>
+                              <MenuAction onClick={() => navigate(`/routing?tab=outbounds&node=${n.id}`)}>{t("nav.outbounds")}</MenuAction>
+                              <MenuAction onClick={() => { setMenuNodeId(null); setCoreNode(n); }}>{t("x.manageCores")}</MenuAction>
+                              <MenuAction onClick={() => doRotate(n)}>{t("x.rotateCert")}</MenuAction>
+                              <MenuAction onClick={() => { setEditing(n); setMenuNodeId(null); }}>
+                                {t("common.edit")}
+                              </MenuAction>
+                              <MenuAction className="text-danger hover:bg-danger/10" onClick={() => remove(n)}>
+                                {t("common.delete")}
+                              </MenuAction>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {(n.core_version || n.enrollment_phase || meteringOf(n) === "unmetered") && (
+                  <div className="flex flex-wrap items-center gap-1 -mt-2">
+                    {meteringOf(n) === "unmetered" && (
+                      <span title="This core build cannot count traffic per user">
+                        <Badge color="warning">{t("nodes.unmetered")}</Badge>
+                      </span>
+                    )}
+                    {meteringOf(n) === "unknown" && (
+                      <Badge color="muted">{t("nodes.meteringUnknown")}</Badge>
+                    )}
+                    {n.enrollment_phase && n.enrollment_phase !== "synced" && (
+                      <Badge color={n.enrollment_phase === "connected" ? "on_hold" : "muted"}>
+                        {phaseLabel(n.enrollment_phase)}
+                      </Badge>
+                    )}
+                    {!online && n.diagnostics && n.diagnostics.code !== "ok" && (
+                      <Badge color={diagColor(n.diagnostics.code)}>
+                        {diagLabel(n.diagnostics.code)}
+                      </Badge>
+                    )}
+                  </div>
+                )}
+
+                <div className="space-y-1.5">
+                  <MetricBar icon={<Cpu size={10} />} label="CPU" value={n.health.cpu_percent} />
+                  <MetricBar icon={<MemoryStick size={10} />} label="RAM" value={n.health.mem_percent} />
+                  <MetricBar icon={<HardDrive size={10} />} label="Disk" value={n.health.disk_percent} />
+                </div>
+
+                <div className="grid grid-cols-2 gap-x-3 gap-y-2.5 pt-3 border-t border-border/50">
+                  <div>
+                    <p className="text-[9px] font-semibold uppercase tracking-wide text-fg-subtle flex items-center gap-1">
+                      <Signal size={9} /> Latency
+                    </p>
+                    <p className="text-xs font-bold text-fg tabular-nums mt-0.5">
+                      {n.ping_ms && n.ping_ms > 0 ? `${n.ping_ms}ms` : "—"}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[9px] font-semibold uppercase tracking-wide text-fg-subtle flex items-center gap-1">
+                      <Users size={9} /> {t("nodes.users")}
+                    </p>
+                    <p className="text-xs font-bold text-fg tabular-nums mt-0.5">{n.users_count ?? 0}</p>
+                  </div>
+                  <div>
+                    <p className="text-[9px] font-semibold uppercase tracking-wide text-fg-subtle">
+                      {t("nodes.connections")}
+                    </p>
+                    <p className="text-xs font-bold text-fg tabular-nums mt-0.5">{n.health.connections}</p>
+                  </div>
+                  <div>
+                    <p className="text-[9px] font-semibold uppercase tracking-wide text-fg-subtle">
+                      {t("nodes.core")}
+                    </p>
+                    <div className="mt-0.5"><CoreBadge core={n.core} enabledCores={n.enabled_cores} /></div>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between pt-3 border-t border-border/50 text-[10px] text-fg-subtle">
+                  <span className="font-mono truncate" dir="ltr">{n.address}</span>
+                  <span className="flex-shrink-0">
+                    {online ? "· live" : `${t("nodes.lastSeen")} ${timeAgoShort(n.last_seen)}`}
+                  </span>
+                </div>
+              </GlassCard>
+            );
+          })}
+        </div>
+      )}
+
+      {!isLoading && filteredNodes.length > 0 && (
+        <p className="text-xs text-fg-subtle text-center">
+          {t("nodes.showingOf")
+            .replace("{count}", String(filteredNodes.length))
+            .replace("{total}", String(nodes.length))}
+        </p>
+      )}
+
+      <Modal
+        open={!!rotatedBundle}
+        onClose={() => { setRotatedBundle(null); setRotatedFor(null); }}
+        title={`New certificate — ${rotatedFor?.name ?? ""}`}
+        className="max-w-lg"
+      >
+        <div className="space-y-3">
+          {rotatedBundle?.pushed ? (
+            <p className="text-sm text-fg-muted">
+              The new identity was delivered to the node and is already in use — no restart, no SSH
+              needed. The panel now accepts only this certificate. Keep the bundle below as a backup
+              in case the node is ever rebuilt.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-fg-muted">
+                The old identity is revoked. Install this bundle on the node and restart{" "}
+                <span className="font-mono">vortexui-node</span>; until then the panel rejects its
+                previous certificate.
+              </p>
+              {rotatedBundle?.push_error && (
+                <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-2 text-[11px] text-amber-500">
+                  Could not push automatically: {rotatedBundle.push_error}
+                </p>
+              )}
+            </>
+          )}
+          {rotatedBundle && (
+            <>
+              <div className="rounded-xl bg-surface-2/50 p-3">
+                <div className="text-[10px] font-semibold uppercase text-fg-subtle">Node certificate fingerprint</div>
+                <div className="mt-1 break-all font-mono text-[11px] text-fg" dir="ltr">{rotatedBundle.fingerprint}</div>
+              </div>
+              <div className="rounded-xl bg-surface-2/50 p-3">
+                <div className="text-[10px] font-semibold uppercase text-fg-subtle">Panel CA fingerprint</div>
+                <div className="mt-1 break-all font-mono text-[11px] text-fg" dir="ltr">{rotatedBundle.ca_fingerprint}</div>
+              </div>
+              <textarea
+                readOnly
+                value={rotatedBundle.bundle}
+                className="h-24 w-full resize-none rounded-lg border border-border/60 bg-surface-2/40 p-2 font-mono text-[10px] text-fg"
+                dir="ltr"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full"
+                onClick={() => {
+                  void navigator.clipboard.writeText(rotatedBundle.bundle);
+                  toast.success("Bundle copied");
+                }}
+              >
+                <Copy size={14} /> Copy enrollment bundle
+              </Button>
+            </>
+          )}
+          <div className="flex justify-end pt-1">
+            <Button type="button" onClick={() => { setRotatedBundle(null); setRotatedFor(null); }}>Done</Button>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function MenuAction({
+  children,
+  onClick,
+  className,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "w-full px-3 py-2 text-start text-fg hover:bg-surface-2/60 transition",
+        className,
+      )}
+    >
+      {children}
+    </button>
+  );
+}
